@@ -97,6 +97,7 @@ class TranscriptionConfig:
     # Word-level timestamps + hotwords
     word_timestamps: bool = False
     hotwords: str = ""                     # Comma-separated terms to boost recognition
+    profile_name: str = ""                 # Resolved ASR profile (e.g. "distil", "turbo")
 
 
 def _env_default(key: str, fallback: str) -> str:
@@ -159,8 +160,16 @@ class LLMConfig:
 
 
 @dataclass(frozen=True)
-class ClipboardConfig:
+class DiarizationConfig:
     enabled: bool = False
+    method: str = "resemblyzer"  # "resemblyzer" | "spectral"
+    similarity_threshold: float = 0.65
+    enrollment_chunks: int = 5
+
+
+@dataclass(frozen=True)
+class ClipboardConfig:
+    enabled: bool = True
     wl_copy_path: str = "wl-copy"
     xclip_path: str = "xclip"
 
@@ -173,22 +182,14 @@ class TypingConfig:
 
 
 @dataclass(frozen=True)
-class DiarizationConfig:
-    enabled: bool = False
-    method: str = "resemblyzer"  # "resemblyzer" | "spectral"
-    similarity_threshold: float = 0.65
-    enrollment_chunks: int = 5
-
-
-@dataclass(frozen=True)
 class AppConfig:
     audio: AudioConfig = field(default_factory=AudioConfig)
     vad: VADConfig = field(default_factory=VADConfig)
     transcription: TranscriptionConfig = field(default_factory=TranscriptionConfig)
     llm: LLMConfig = field(default_factory=LLMConfig)
+    diarization: DiarizationConfig = field(default_factory=DiarizationConfig)
     clipboard: ClipboardConfig = field(default_factory=ClipboardConfig)
     typing: TypingConfig = field(default_factory=TypingConfig)
-    diarization: DiarizationConfig = field(default_factory=DiarizationConfig)
     debug: bool = False
     json_mode: bool = False
 

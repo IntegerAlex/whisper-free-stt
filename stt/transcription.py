@@ -7,12 +7,15 @@ BatchedInferencePipeline gives 4-10x additional speedup on GPU.
 
 from __future__ import annotations
 
+import logging
 import threading
 
 import numpy as np
 
 from stt.config import TranscriptionConfig, TranscriptionBackend
 from stt.types import TranscriptionResult, TranscriptionSegment
+
+logger = logging.getLogger(__name__)
 
 # ---------------------------------------------------------------------------
 # Model caches
@@ -46,7 +49,7 @@ def _get_fw_model(config: TranscriptionConfig):
     """Return cached faster-whisper model."""
     from faster_whisper import WhisperModel
 
-    key = f"{config.model_name}|{config.device}|{config.compute_type.value}|{config.cpu_threads}"
+    key = f"{config.model_name}|{config.device}|{str(config.compute_type)}|{config.cpu_threads}"
     if key not in _faster_whisper_cache:
         _faster_whisper_cache[key] = WhisperModel(
             config.model_name,
@@ -76,7 +79,7 @@ def _get_batched_model(config: TranscriptionConfig):
 _JUNK_TOKENS = frozenset({"[BLANK_AUDIO]", "[MUSIC]", "[NOISE]", "[INAUDIBLE]", "[SILENCE]", "[Applause]", "[Laughter]", "[Music]", "[Noise]", "[Silence]", "♪", "♫"})
 
 
-def _trim_silence(audio: np.ndarray, threshold: float = 0.005) -> np.ndarray:
+def _trim_silence(audio: np.ndarray, threshold: float = 0.001) -> np.ndarray:
     """Trim trailing samples below *threshold* amplitude."""
     if len(audio) == 0:
         return audio
@@ -130,10 +133,10 @@ def preprocess_audio(
     if audio_data.dtype != np.float32:
         audio_data = audio_data.astype(np.float32)
     peak = np.max(np.abs(audio_data))
-    if peak > 1.0:
-        audio_data = audio_data / peak
-    elif peak == 0.0:
+    if peak == 0.0:
         return None
+    # Normalize to [-1, 1] range (both loud clipping AND quiet signals)
+    audio_data = audio_data / peak
     audio_data = _reduce_noise(audio_data, sample_rate, config)
     audio_data = _trim_silence(audio_data)
     if len(audio_data) == 0:
@@ -163,14 +166,17 @@ def transcribe(
 
 def warm_up_backend(config: TranscriptionConfig) -> None:
     """Preload model weights to avoid first-utterance cold-start latency."""
-    if config.backend is TranscriptionBackend.WHISPER_CPP:
-        _get_cpp_model(config)
-    else:
-        _get_fw_model(config)
-        # Also warm up batched pipeline if batch_size > 0 or auto (GPU)
-        batch_size = config.batch_size if config.batch_size > 0 else (8 if config.device == "cuda" else 0)
-        if batch_size > 0:
-            _get_batched_model(config)
+    try:
+        if config.backend is TranscriptionBackend.WHISPER_CPP:
+            _get_cpp_model(config)
+        else:
+            _get_fw_model(config)
+            # Also warm up batched pipeline if batch_size > 0 or auto (GPU)
+            batch_size = config.batch_size if config.batch_size > 0 else (8 if config.device == "cuda" else 0)
+            if batch_size > 0:
+                _get_batched_model(config)
+    except Exception as exc:
+        logger.warning("Warm-up failed (non-fatal): %s", exc)
 
 
 # ---------------------------------------------------------------------------
@@ -189,52 +195,75 @@ def _transcribe_cpp(
     sr: int,
     config: TranscriptionConfig,
 ) -> TranscriptionResult:
-    """Transcribe via whisper.cpp with tuned parameters for accuracy."""
-    try:
-        model = _get_cpp_model(config)
-    except Exception as exc:
-        raise RuntimeError(f"Failed to load whisper.cpp model '{config.model_name}': {exc}") from exc
+    """Transcribe via whisper.cpp — runs in a subprocess for crash isolation.
 
+    A native segfault in whisper.cpp would kill the entire process. By running
+    it in a subprocess, we survive the crash and raise a proper Python error.
+    """
+    import json as _json
+    import os
+    import subprocess
+    import sys
+    import tempfile
+
+    # Save audio to temp file for the subprocess
+    audio_path = None
     try:
-        with _whisper_cpp_lock:  # serialise — whisper.cpp is not thread-safe
-            raw_segments = model.transcribe(
-                audio,
-                n_threads=config.cpu_threads,
-                no_context=not config.condition_on_previous_text,
-                single_segment=True,
-                print_progress=False,
-                print_realtime=False,
-                language=config.language or "",
-                # --- Quality tuning ---
-                initial_prompt=_OUTPUT_PROMPT,
-                temperature=0.0,
-                temperature_inc=0.2,
-                no_speech_thold=config.whisper_no_speech_thold,
-                entropy_thold=config.whisper_entropy_thold,
-                logprob_thold=config.whisper_logprob_thold,
-                suppress_non_speech_tokens=True,
-                suppress_blank=True,
-                greedy={"best_of": 5},
+        fd, audio_path = tempfile.mkstemp(suffix=".npy")
+        os.close(fd)
+        np.save(audio_path, audio, allow_pickle=False)
+
+        worker_cfg = {
+            "model_name": config.model_name,
+            "audio_path": audio_path,
+            "n_threads": config.cpu_threads,
+            "language": config.language or "",
+            "condition_on_previous_text": config.condition_on_previous_text,
+            "no_speech_thold": config.whisper_no_speech_thold,
+            "entropy_thold": config.whisper_entropy_thold,
+            "logprob_thold": config.whisper_logprob_thold,
+            "hotwords": config.hotwords or "",
+        }
+
+        proc = subprocess.run(
+            [sys.executable, "-u", "-m", "stt._cpp_worker"],
+            input=_json.dumps(worker_cfg),
+            capture_output=True,
+            text=True,
+            timeout=120,
+        )
+
+        if proc.returncode != 0:
+            stderr_tail = (proc.stderr or "")[-500:]
+            raise RuntimeError(
+                f"whisper.cpp worker crashed (exit {proc.returncode}): {stderr_tail}"
             )
-    except Exception as exc:
-        raise RuntimeError(f"whisper.cpp transcription failed: {exc}") from exc
 
-    segments: list[TranscriptionSegment] = []
-    text_parts: list[str] = []
-    language = ""
+        result = _json.loads(proc.stdout)
 
-    for seg in raw_segments:
-        text = seg.text.strip()
-        if not text or text in _JUNK_TOKENS:
-            continue
-        segments.append(TranscriptionSegment(text=text, start=seg.t0 * 0.01, end=seg.t1 * 0.01))
-        text_parts.append(text)
+        if not result.get("ok"):
+            raise RuntimeError(result.get("error", "whisper.cpp worker returned error"))
 
-    return TranscriptionResult(
-        text=" ".join(text_parts),
-        language=language or (config.language or ""),
-        segments=tuple(segments),
-    )
+        segments = [
+            TranscriptionSegment(text=s["text"], start=s["start"], end=s["end"])
+            for s in result.get("segments", [])
+            if s.get("text", "").strip() not in _JUNK_TOKENS
+        ]
+
+        return TranscriptionResult(
+            text=result.get("text", ""),
+            language=result.get("language", "") or (config.language or ""),
+            segments=tuple(segments),
+        )
+
+    except subprocess.TimeoutExpired:
+        raise RuntimeError("whisper.cpp transcription timed out (120s)")
+    finally:
+        if audio_path and os.path.exists(audio_path):
+            try:
+                os.unlink(audio_path)
+            except OSError:
+                pass
 
 
 # ---------------------------------------------------------------------------
@@ -309,13 +338,13 @@ def _transcribe_fw(
                 audio,
                 batch_size=batch_size,
                 **{k: v for k, v in transcribe_kwargs.items()
-                   if k not in ("word_timestamps", "hotwords")},  # batched doesn't support these yet
+                   if k != "word_timestamps"},  # batched doesn't support word_timestamps yet
             )
         else:
             raw_segments, info = model.transcribe(audio, **transcribe_kwargs)
     except Exception as exc:
-        err = str(exc)
-        if "libcublas" in err or "cublas" in err.lower():
+        err = str(exc).lower()
+        if "libcublas" in err or "cublas" in err or "out of memory" in err or ("cuda" in err and "error" in err):
             import os
             os.environ["CT2_FORCE_CPU"] = "1"
             from faster_whisper import WhisperModel

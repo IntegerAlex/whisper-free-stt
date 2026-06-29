@@ -9,13 +9,28 @@ interface Props {
   onClose: () => void;
 }
 
+const HOTKEY_OPTIONS = [
+  { value: "CommandOrControl+Shift+Space", label: "Ctrl + Shift + Space" },
+  { value: "CommandOrControl+Alt+Space", label: "Ctrl + Alt + Space" },
+  { value: "Alt+Space", label: "Alt + Space" },
+  { value: "Super+Space", label: "Super + Space" },
+  { value: "CommandOrControl+Shift+K", label: "Ctrl + Shift + K" },
+];
+
 export default function SettingsPanel({ settings, onSave, visible, onClose }: Props) {
   const [local, setLocal] = useState<RuntimeSettings>({ ...settings });
   const [showKeys, setShowKeys] = useState(false);
+  const [hotkey, setHotkey] = useState(() => localStorage.getItem("stt-hotkey") || "CommandOrControl+Shift+Space");
 
   useEffect(() => {
     setLocal({ ...settings });
   }, [settings]);
+
+  useEffect(() => {
+    if (visible) {
+      setHotkey(localStorage.getItem("stt-hotkey") || "CommandOrControl+Shift+Space");
+    }
+  }, [visible]);
 
   const handleKeyDown = useCallback((e: KeyboardEvent) => {
     if (e.key === "Escape" && visible) {
@@ -36,7 +51,7 @@ export default function SettingsPanel({ settings, onSave, visible, onClose }: Pr
 
   const inputClass = cn(
     "w-full rounded-input bg-app-surface-secondary border border-border px-3 py-2 text-body text-text-primary",
-    "placeholder:text-text-muted focus:outline-none focus:ring-2 focus:ring-accent/50 transition-colors",
+    "placeholder:text-text-muted focus:outline-none focus:ring-2 focus:ring-accent/30 transition-colors",
   );
 
   return (
@@ -54,7 +69,7 @@ export default function SettingsPanel({ settings, onSave, visible, onClose }: Pr
             className={cn(
               "inline-flex items-center justify-center rounded-button h-8 px-3 text-small font-medium transition-all duration-200",
               "bg-app-surface border border-border text-text-primary hover:bg-app-hover",
-              "focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-accent/50",
+              "focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-accent/30",
             )}
             onClick={onClose}
             aria-label="Close settings"
@@ -144,6 +159,20 @@ export default function SettingsPanel({ settings, onSave, visible, onClose }: Pr
           <div className="flex flex-col gap-3">
             <h3 className="text-subheading text-text-primary">🎤 Speech Recognition</h3>
             <div className="flex flex-col gap-1.5">
+              <label htmlFor="settings-hotkey" className="text-label text-text-secondary">Push-to-Talk Hotkey</label>
+              <select
+                id="settings-hotkey"
+                className={inputClass}
+                value={hotkey}
+                onChange={(e) => setHotkey(e.target.value)}
+              >
+                {HOTKEY_OPTIONS.map((opt) => (
+                  <option key={opt.value} value={opt.value}>{opt.label}</option>
+                ))}
+              </select>
+              <p className="text-small text-text-muted">Hold to record, release to commit text.</p>
+            </div>
+            <div className="flex flex-col gap-1.5">
               <label htmlFor="settings-language" className="text-label text-text-secondary">Language</label>
               <select
                 id="settings-language"
@@ -183,10 +212,10 @@ export default function SettingsPanel({ settings, onSave, visible, onClose }: Pr
             className={cn(
               "inline-flex items-center justify-center rounded-button h-11 px-4 py-2 text-body font-medium transition-all duration-200",
               "bg-accent text-white hover:bg-accent-warm shadow-accent-button",
-              "focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-accent/50",
+              "focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-accent/30",
               "disabled:pointer-events-none disabled:opacity-50",
             )}
-            onClick={() => { onSave(local); onClose(); }}
+            onClick={() => { localStorage.setItem("stt-hotkey", hotkey); onSave(local); onClose(); }}
           >
             Save & Apply
           </button>

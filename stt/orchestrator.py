@@ -6,6 +6,7 @@ Mic stays open. Transcription runs in background threads. Text prints as you spe
 from __future__ import annotations
 
 import asyncio as _asyncio
+import faulthandler
 import json as _json
 import os
 import re
@@ -20,6 +21,14 @@ from typing import Callable
 
 import numpy as np
 from stt.log import get_logger
+from stt.clipboard import copy_to_clipboard
+from stt.typing import type_to_focused_input
+
+# Enable fault handler so segfaults print a traceback instead of silent exit
+try:
+    faulthandler.enable()
+except Exception:
+    pass
 
 from stt.config import AppConfig, LLMMode, TranscriptionBackend
 
@@ -33,8 +42,6 @@ from stt.vad import (
 )
 from stt.transcription import transcribe, warm_up_backend
 from stt.llm import rewrite, rewrite_stream, _clean_response
-from stt.clipboard import copy_to_clipboard
-from stt.typing import type_to_focused_input
 from stt.history import get_store
 from stt.embeddings import build_few_shot_context as _build_few_shot_ctx
 
@@ -46,7 +53,6 @@ from stt.embeddings import build_few_shot_context as _build_few_shot_ctx
 @dataclass(frozen=True)
 class RunHooks:
     on_state: Callable[[str], None] | None = None
-    on_activity: Callable[[str], None] | None = None
     on_partial: Callable[[str], None] | None = None
     on_raw: Callable[[str], None] | None = None
     on_processed: Callable[[str], None] | None = None
@@ -293,14 +299,37 @@ def _probe_hardware(config: AppConfig) -> None:
         if cuda_devices > 0:
             # Verify libcublas is actually loadable
             import ctypes
+            import sys
+            import os
+            import site
             lib_ok = False
-            for lib in ("libcublas.so.12", "libcublas.so.11"):
-                try:
-                    ctypes.CDLL(lib)
-                    lib_ok = True
-                    break
-                except OSError:
-                    continue
+            if sys.platform == "win32":
+                # Check pip-installed nvidia-cublas package
+                for sp in (site.getsitepackages() if hasattr(site, 'getsitepackages') else []):
+                    cublas_dll = os.path.join(sp, "nvidia", "cublas", "bin", "cublas64_12.dll")
+                    if os.path.isfile(cublas_dll):
+                        try:
+                            ctypes.CDLL(cublas_dll)
+                            lib_ok = True
+                            break
+                        except OSError:
+                            continue
+                if not lib_ok:
+                    for lib in ("cublas64_12.dll", "cublas64_11.dll"):
+                        try:
+                            ctypes.CDLL(lib)
+                            lib_ok = True
+                            break
+                        except OSError:
+                            continue
+            else:
+                for lib in ("libcublas.so.12", "libcublas.so.11"):
+                    try:
+                        ctypes.CDLL(lib)
+                        lib_ok = True
+                        break
+                    except OSError:
+                        continue
             if lib_ok:
                 results.append(f"faster-whisper: available (CUDA, {cuda_devices} device(s))")
             else:
@@ -492,119 +521,73 @@ def run(
         return
 
     _echo(f"LLM: {config.llm.mode.value} ({config.llm.provider.value}:{config.llm.model})")
-    _echo(f"Typing: {'enabled' if config.typing.enabled else 'disabled'}")
-    _echo(f"Clipboard: {'enabled' if config.clipboard.enabled else 'disabled'}")
     if config.vad.fast_commit:
         _echo("VAD: fast-commit mode")
     _echo()
 
-    _echo("Listening... (speak naturally, Ctrl+C to stop)")
-    _echo("-" * 40)
-    _json_emit(config, {"type": "state", "state": "listening"})
+    # Emit model info so frontend can display the resolved profile/model
+    _json_emit(config, {
+        "type": "info",
+        "profile": config.transcription.profile_name,
+        "model": config.transcription.model_name,
+        "backend": config.transcription.backend.value,
+        "device": config.transcription.device,
+    })
+
+    # --- Wait for frontend to send "start_recording" before opening mic ---
+    # This is the PTT gate: backend stays idle until explicitly told to record.
+    #例外: when run directly from a terminal (TTY), auto-start immediately.
+    _echo("Engine ready. Waiting for start_recording command...")
+    _json_emit(config, {"type": "state", "state": "idle"})
     if hooks and hooks.on_state:
-        hooks.on_state("listening")
-    if hooks and hooks.on_activity:
-        hooks.on_activity("Listening")
+        hooks.on_state("idle")
+
+    _start_event = threading.Event()
+    _stop_event = threading.Event()
+    _stdin_alive = True
+    _is_tty = sys.stdin.isatty()
+
+    def _stdin_reader():
+        """Read JSON commands from stdin (one per line)."""
+        nonlocal _stdin_alive
+        try:
+            for line in sys.stdin:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    cmd = _json.loads(line)
+                    if cmd.get("type") == "start_recording":
+                        _start_event.set()
+                    elif cmd.get("type") == "stop_recording":
+                        _stop_event.set()
+                        _start_event.set()  # Also unblocks if waiting
+                except _json.JSONDecodeError:
+                    pass
+        except (EOFError, OSError):
+            pass
+        _stdin_alive = False
+        _start_event.set()  # Unblock main thread if waiting on start
+
+    stdin_thread = threading.Thread(target=_stdin_reader, daemon=True)
+    stdin_thread.start()
+
+    if _is_tty:
+        # Interactive terminal — auto-start recording immediately
+        _echo("Running in terminal — auto-starting recording (Ctrl+C to stop)...")
+        _start_event.set()
 
     sr = config.audio.sample_rate
     block_size = config.audio.blocksize
-    ring = _RingBuffer(int(30 * sr))
-    detector = StreamingEndpointDetector(config.vad, sr, block_size)
-
-    # Apply fast-commit overrides on the detector directly
-    if config.vad.fast_commit:
-        detector.set_fast_commit(
-            silence_duration_sec=config.vad.fast_silence_duration_sec,
-            detrigger_ratio=config.vad.fast_detrigger_ratio,
-        )
 
     # Warm the selected ASR backend in parallel with calibration.
     warmup_thread = threading.Thread(target=warm_up_backend, args=(config.transcription,), daemon=True)
     warmup_thread.start()
 
-    # --- Noise floor calibration ---
-    _debug(config, "calibrating noise floor (1.5s)...")
-    calib_rms: list[float] = []
-    calib_centroid: list[float] = []
-    calib_flux: list[float] = []
-    calib_zcr: list[float] = []
-    calib_ber: list[float] = []
-    try:
-        # Store generator for both calibration and main loop; cleaned up in finally.
-        stream_iter = mic_stream(config.audio, debug=False)
-        deadline = time.monotonic() + 1.5
-        while time.monotonic() < deadline:
-            chunk = next(stream_iter)
-            ring.extend(chunk)
-            calib_rms.append(compute_rms(chunk))
-            if config.vad.use_spectral_vad:
-                calib_centroid.append(compute_spectral_centroid(chunk, sr))
-                calib_flux.append(compute_spectral_flux(chunk, sr))
-                calib_zcr.append(compute_zero_crossing_rate(chunk))
-                calib_ber.append(compute_band_energy_ratio(
-                    chunk, sr,
-                    config.vad.speech_band_low_hz,
-                    config.vad.speech_band_high_hz,
-                ))
-    except StopIteration:
-        pass
-    except Exception as exc:
-        if hooks and hooks.on_error:
-            hooks.on_error(f"Microphone stream failed: {exc}")
-        if hooks and hooks.on_state:
-            hooks.on_state("error")
-        return
-
-    if calib_rms:
-        sorted_r = sorted(calib_rms)
-        p10 = sorted_r[len(sorted_r) // 10]
-        detector.set_noise_floor(p10)
-        st, et = detector.thresholds()
-        _debug(config, f"calibration: p10={p10:.4f}, start_th={st:.4f}, end_th={et:.4f}")
-
-    if calib_centroid and config.vad.use_spectral_vad:
-        # Use robust percentile (p10) like RMS — not mean, which is sensitive
-        # to transient noise (mouse clicks, keyboard taps during calibration).
-        sorted_c = sorted(calib_centroid)
-        sorted_f = sorted(calib_flux)
-        sorted_z = sorted(calib_zcr)
-        sorted_b = sorted(calib_ber)
-        p10_idx = max(0, len(sorted_c) // 10)
-        avg_centroid = float(sorted_c[p10_idx])
-        avg_flux = float(sorted_f[p10_idx])
-        avg_zcr = float(sorted_z[p10_idx])
-        avg_ber = float(sorted_b[p10_idx])
-        detector.set_spectral_baselines(avg_centroid, avg_flux, avg_zcr, avg_ber)
-        _debug(config, f"calibration: centroid={avg_centroid:.0f}Hz, flux={avg_flux:.4f}, "
-               f"zcr={avg_zcr:.4f}, ber={avg_ber:.4f}")
-
-    # --- Speaker enrollment ---
+    # --- Speaker enrollment (deferred for non-TTY: done after start_recording) ---
     speaker_verifier: SpeakerVerifier | None = None
     speaker_profile: NDArray[np.float32] | None = None
-    if config.diarization.enabled:
-        from numpy import NDArray
-        speaker_verifier = SpeakerVerifier(method=config.diarization.method)
-        enrollment_embs: list[NDArray[np.float32]] = []
-        n_chunks = config.diarization.enrollment_chunks
-        _debug(config, f"speaker enrollment: collecting {n_chunks} chunks...")
-        try:
-            for _ in range(n_chunks):
-                chunk = next(stream_iter)
-                ring.extend(chunk)
-                emb = speaker_verifier.embed(chunk, sr)
-                enrollment_embs.append(emb)
-            if len(enrollment_embs) >= 2:
-                speaker_profile = speaker_verifier.enroll(enrollment_embs)
-                _debug(config, f"speaker profile created ({len(enrollment_embs)} chunks)")
-            else:
-                _debug(config, "speaker enrollment: insufficient audio, skipping")
-                speaker_profile = None
-        except StopIteration:
-            _debug(config, "speaker enrollment: stream ended early")
-            speaker_profile = None
-        except Exception as exc:
-            _debug(config, f"speaker enrollment failed: {exc}")
-            speaker_profile = None
+    stream_iter = None  # Will be opened after start_recording in non-TTY mode
 
     running = True
     def _stop(_sig, _frame):
@@ -619,86 +602,196 @@ def run(
             signal.signal(signal.SIGINT, _stop)
         else:
             msg = "Signal handlers disabled (run() is not on main thread)"
-            if hooks and hooks.on_activity:
-                hooks.on_activity(msg)
-            else:
-                _echo(msg)
+            _echo(msg)
 
-    chunk_count = 0
-    utterance_id = 0
-    try:
-        for chunk in stream_iter:
-            if not running or (stop_event is not None and stop_event.is_set()):
+    # --- PTT loop: wait for start → record → wait for stop → repeat ---
+    while _stdin_alive or _is_tty:
+        if not _is_tty:
+            _start_event.wait()
+            if not _stdin_alive:
+                _echo("Received stop before start — exiting.")
+                return
+        else:
+            if not running:
                 break
-            chunk_start = ring.total_samples()
-            ring.extend(chunk)
-            chunk_end = ring.total_samples()
-            rms = compute_rms(chunk)
-            if hooks and hooks.on_mic_level:
-                hooks.on_mic_level(rms)
-            if config.json_mode and chunk_count % 8 == 0:
-                _json_emit(config, {"type": "mic", "level": round(rms, 6)})
-            chunk_count += 1
 
-            if config.debug and chunk_count % 8 == 0:
-                st, et = detector.thresholds()
-                noise = detector.noise_floor
-                snr_db = 20 * np.log10(rms / max(noise, 1e-10)) if noise > 0 else 0
-                state = detector.vad_state.name
-                _debug(config, f"rms={rms:.6f} noise={noise:.4f} snr={snr_db:.1f}dB state={state}")
-                if config.vad.use_spectral_vad:
-                    score = detector._compute_speech_score(chunk)
-                    _debug(config, f"  spectral: score={score:.4f}")
-
-            event = detector.update(
-                rms=rms,
-                chunk_start_sample=chunk_start,
-                chunk_end_sample=chunk_end,
-                chunk=chunk if config.vad.use_spectral_vad else None,
+        # --- Open mic + calibrate (only after start_recording) ---
+        ring = _RingBuffer(int(30 * sr))
+        detector = StreamingEndpointDetector(config.vad, sr, block_size)
+        if config.vad.fast_commit:
+            detector.set_fast_commit(
+                silence_duration_sec=config.vad.fast_silence_duration_sec,
+                detrigger_ratio=config.vad.fast_detrigger_ratio,
             )
-            if event is None or event.kind == "start":
-                if event:
-                    _debug(config, f"speech start at {event.start_sample/sr:.2f}s")
-                continue
-            if event.end_sample is None:
-                continue
+        _debug(config, "calibrating noise floor (1.5s)...")
+        calib_rms: list[float] = []
+        calib_centroid: list[float] = []
+        calib_flux: list[float] = []
+        calib_zcr: list[float] = []
+        calib_ber: list[float] = []
+        try:
+            stream_iter = mic_stream(config.audio, debug=False)
+            deadline = time.monotonic() + 1.5
+            while time.monotonic() < deadline:
+                chunk = next(stream_iter)
+                ring.extend(chunk)
+                calib_rms.append(compute_rms(chunk))
+                if config.vad.use_spectral_vad:
+                    calib_centroid.append(compute_spectral_centroid(chunk, sr))
+                    calib_flux.append(compute_spectral_flux(chunk, sr))
+                    calib_zcr.append(compute_zero_crossing_rate(chunk))
+                    calib_ber.append(compute_band_energy_ratio(
+                        chunk, sr,
+                        config.vad.speech_band_low_hz,
+                        config.vad.speech_band_high_hz,
+                    ))
+        except StopIteration:
+            pass
+        except Exception as exc:
+            if hooks and hooks.on_error:
+                hooks.on_error(f"Microphone stream failed: {exc}")
+            if hooks and hooks.on_state:
+                hooks.on_state("error")
+            continue
 
-            segment = ring.slice_range(event.start_sample, event.end_sample)
-            if len(segment) == 0:
-                continue
+        if calib_rms:
+            sorted_r = sorted(calib_rms)
+            p10 = sorted_r[len(sorted_r) // 10]
+            detector.set_noise_floor(p10)
+            st, et = detector.thresholds()
+            _debug(config, f"calibration: p10={p10:.4f}, start_th={st:.4f}, end_th={et:.4f}")
 
-            dur = len(segment) / sr
-            rms_seg = compute_rms(segment)
-            _debug(config, f"utterance: {dur:.1f}s, rms={rms_seg:.4f}"
-                    + (" [forced split]" if event.forced_split else ""))
+        if calib_centroid and config.vad.use_spectral_vad:
+            sorted_c = sorted(calib_centroid)
+            sorted_f = sorted(calib_flux)
+            sorted_z = sorted(calib_zcr)
+            sorted_b = sorted(calib_ber)
+            p10_idx = max(0, len(sorted_c) // 10)
+            avg_centroid = float(sorted_c[p10_idx])
+            avg_flux = float(sorted_f[p10_idx])
+            avg_zcr = float(sorted_z[p10_idx])
+            avg_ber = float(sorted_b[p10_idx])
+            detector.set_spectral_baselines(avg_centroid, avg_flux, avg_zcr, avg_ber)
+            _debug(config, f"calibration: centroid={avg_centroid:.0f}Hz, flux={avg_flux:.4f}, "
+                   f"zcr={avg_zcr:.4f}, ber={avg_ber:.4f}")
 
-            if dur < config.vad.min_recording_sec:
-                continue
+        # --- Speaker enrollment (on first start only) ---
+        if speaker_verifier is None and config.diarization.enabled:
+            from numpy import NDArray
+            speaker_verifier = SpeakerVerifier(method=config.diarization.method)
+            enrollment_embs: list[NDArray[np.float32]] = []
+            n_chunks = config.diarization.enrollment_chunks
+            _debug(config, f"speaker enrollment: collecting {n_chunks} chunks...")
+            try:
+                for _ in range(n_chunks):
+                    chunk = next(stream_iter)
+                    ring.extend(chunk)
+                    emb = speaker_verifier.embed(chunk, sr)
+                    enrollment_embs.append(emb)
+                if len(enrollment_embs) >= 2:
+                    speaker_profile = speaker_verifier.enroll(enrollment_embs)
+                    _debug(config, f"speaker profile created ({len(enrollment_embs)} chunks)")
+                else:
+                    _debug(config, "speaker enrollment: insufficient audio, skipping")
+                    speaker_profile = None
+            except StopIteration:
+                _debug(config, "speaker enrollment: stream ended early")
+                speaker_profile = None
+            except Exception as exc:
+                _debug(config, f"speaker enrollment failed: {exc}")
+                speaker_profile = None
 
-            # Speaker gate: reject segments that don't match enrolled speaker
-            if config.diarization.enabled and speaker_verifier is not None and speaker_profile is not None:
-                accepted, score = speaker_verifier.verify(segment, sr, speaker_profile, threshold=config.diarization.similarity_threshold)
-                _json_emit(config, {"type": "speaker", "accepted": accepted, "similarity": round(score, 4)})
-                if not accepted:
-                    _debug(config, f"speaker rejected: sim={score:.3f}")
+        _echo("Recording started by frontend.")
+        _json_emit(config, {"type": "state", "state": "listening"})
+        if hooks and hooks.on_state:
+            hooks.on_state("listening")
+
+        chunk_count = 0
+        utterance_id = 0
+        try:
+            for chunk in stream_iter:
+                if not running or (stop_event is not None and stop_event.is_set()) or _stop_event.is_set():
+                    break
+                chunk_start = ring.total_samples()
+                ring.extend(chunk)
+                chunk_end = ring.total_samples()
+                rms = compute_rms(chunk)
+                if hooks and hooks.on_mic_level:
+                    hooks.on_mic_level(rms)
+                if config.json_mode and chunk_count % 8 == 0:
+                    _json_emit(config, {"type": "mic", "level": round(rms, 6)})
+                chunk_count += 1
+
+                if config.debug and chunk_count % 8 == 0:
+                    st, et = detector.thresholds()
+                    noise = detector.noise_floor
+                    snr_db = 20 * np.log10(rms / max(noise, 1e-10)) if noise > 0 else 0
+                    state = detector.vad_state.name
+                    _debug(config, f"rms={rms:.6f} noise={noise:.4f} snr={snr_db:.1f}dB state={state}")
+                    if config.vad.use_spectral_vad:
+                        score = detector._compute_speech_score(chunk)
+                        _debug(config, f"  spectral: score={score:.4f}")
+
+                event = detector.update(
+                    rms=rms,
+                    chunk_start_sample=chunk_start,
+                    chunk_end_sample=chunk_end,
+                    chunk=chunk if config.vad.use_spectral_vad else None,
+                )
+                if event is None or event.kind == "start":
+                    if event:
+                        _debug(config, f"speech start at {event.start_sample/sr:.2f}s")
+                    continue
+                if event.end_sample is None:
                     continue
 
-            utterance_id += 1
-            thread = threading.Thread(
-                target=_transcribe_and_print,
-                args=(config, segment.copy(), sr, ring.total_samples() / sr, utterance_id, telemetry, hooks),
-                daemon=True,
-            )
-            thread.start()
+                segment = ring.slice_range(event.start_sample, event.end_sample)
+                if len(segment) == 0:
+                    continue
 
-    except KeyboardInterrupt:
-        pass
-    finally:
-        if stream_iter is not None:
-            try:
-                stream_iter.close()
-            except Exception:
-                pass
+                dur = len(segment) / sr
+                rms_seg = compute_rms(segment)
+                _debug(config, f"utterance: {dur:.1f}s, rms={rms_seg:.4f}"
+                        + (" [forced split]" if event.forced_split else ""))
+
+                if dur < config.vad.min_recording_sec:
+                    continue
+
+                # Speaker gate: reject segments that don't match enrolled speaker
+                if config.diarization.enabled and speaker_verifier is not None and speaker_profile is not None:
+                    accepted, score = speaker_verifier.verify(segment, sr, speaker_profile, threshold=config.diarization.similarity_threshold)
+                    _json_emit(config, {"type": "speaker", "accepted": accepted, "similarity": round(score, 4)})
+                    if not accepted:
+                        _debug(config, f"speaker rejected: sim={score:.3f}")
+                        continue
+
+                utterance_id += 1
+                thread = threading.Thread(
+                    target=_transcribe_and_print,
+                    args=(config, segment.copy(), sr, ring.total_samples() / sr, utterance_id, telemetry, hooks),
+                    daemon=True,
+                )
+                thread.start()
+
+        except KeyboardInterrupt:
+            break
+        finally:
+            pass  # Don't close stream_iter — reuse across PTT sessions
+
+        # Recording session ended — wait for next start or exit
+        _stop_event.clear()
+        _start_event.clear()
+        _json_emit(config, {"type": "state", "state": "idle"})
+        if hooks and hooks.on_state:
+            hooks.on_state("idle")
+        _echo("Recording stopped. Waiting for start_recording...")
+
+    # --- Cleanup: close stream and print telemetry ---
+    if stream_iter is not None:
+        try:
+            stream_iter.close()
+        except Exception:
+            pass
 
     # --- Print telemetry summary on exit ---
     snap = telemetry.snapshot()
@@ -716,8 +809,6 @@ def run(
     _echo("\nDone.")
     if hooks and hooks.on_state:
         hooks.on_state("idle")
-    if hooks and hooks.on_activity:
-        hooks.on_activity("Stopped")
 
 
 # ---------------------------------------------------------------------------
@@ -775,6 +866,13 @@ def run_ws_audio(
 
     chunk_count = 0
     utterance_id = 0
+    _json_emit(config, {
+        "type": "info",
+        "profile": config.transcription.profile_name,
+        "model": config.transcription.model_name,
+        "backend": config.transcription.backend.value,
+        "device": config.transcription.device,
+    })
     _json_emit(config, {"type": "state", "state": "listening"})
     if hooks and hooks.on_state:
         hooks.on_state("listening")
@@ -861,6 +959,28 @@ def run_ws_audio(
 # Background transcription + LLM + clipboard
 # ---------------------------------------------------------------------------
 
+def _output_text(text: str, config: AppConfig) -> None:
+    """Type text into focused input and copy to clipboard (CLI mode only)."""
+    if not text.strip():
+        return
+    # Type into focused input
+    try:
+        typed = type_to_focused_input(text, config.typing)
+        if typed:
+            _debug(config, "typed text into focused input")
+        else:
+            _debug(config, "typing skipped or failed")
+    except Exception as exc:
+        _debug(config, f"typing error: {exc}")
+    # Copy to clipboard
+    try:
+        copied = copy_to_clipboard(text, config.clipboard)
+        if copied:
+            _debug(config, "copied to clipboard")
+    except Exception as exc:
+        _debug(config, f"clipboard error: {exc}")
+
+
 def _transcribe_and_print(
     config: AppConfig,
     audio: np.ndarray,
@@ -907,13 +1027,51 @@ def _transcribe_and_print(
     _json_emit(config, {"type": "state", "state": "transcribing", "utterance_id": utterance_id})
     if hooks and hooks.on_state:
         hooks.on_state("transcribing")
-    if hooks and hooks.on_activity:
-        hooks.on_activity("Transcribing")
     ts_asr = time.monotonic()
+
+    # Build a local transcription config (thread-safe, VAD already done by orchestrator)
+    tcfg = config.transcription
     try:
-        result = _transcribe_with_partials(audio, sr, config.transcription, _on_partial)
+        from stt.config import TranscriptionConfig
+        # Always create a copy with vad_filter=False — orchestrator already segments audio
+        tcfg = TranscriptionConfig(
+            backend=tcfg.backend,
+            model_name=tcfg.model_name,
+            compute_type=tcfg.compute_type,
+            device=tcfg.device,
+            cpu_threads=tcfg.cpu_threads,
+            language=tcfg.language,
+            beam_size=tcfg.beam_size,
+            condition_on_previous_text=tcfg.condition_on_previous_text,
+            hotwords=tcfg.hotwords,
+            word_timestamps=tcfg.word_timestamps,
+            batch_size=tcfg.batch_size,
+            noise_reduce=tcfg.noise_reduce,
+            noise_reduce_prop_decrease=tcfg.noise_reduce_prop_decrease,
+            vad_filter=False,  # orchestrator VAD already segmented this audio
+            vad_min_silence_ms=tcfg.vad_min_silence_ms,
+            vad_max_speech_sec=tcfg.vad_max_speech_sec,
+            whisper_no_speech_thold=tcfg.whisper_no_speech_thold,
+            whisper_entropy_thold=tcfg.whisper_entropy_thold,
+            whisper_logprob_thold=tcfg.whisper_logprob_thold,
+            whisper_compression_ratio_thold=tcfg.whisper_compression_ratio_thold,
+        )
+
+        # Merge dictionary hotwords into the local config
+        use_weighted = tcfg.backend is not TranscriptionBackend.WHISPER_CPP
+        dict_hotwords = get_store().get_dict_hotwords(weighted=use_weighted)
+        if dict_hotwords:
+            merged = ", ".join(filter(None, [tcfg.hotwords, dict_hotwords]))
+            object.__setattr__(tcfg, "hotwords", merged)
+            _debug(config, f"dictionary hotwords merged: {len(dict_hotwords.split(','))} terms")
+    except Exception as exc:
+        logger.warning("Failed to build transcription config with dictionary: %s", exc)
+
+    try:
+        result = _transcribe_with_partials(audio, sr, tcfg, _on_partial)
     except Exception as exc:
         _debug(config, f"transcription error: {exc}")
+        _json_emit(config, {"type": "error", "message": f"Transcription error: {exc}", "utterance_id": utterance_id})
         if hooks and hooks.on_error:
             hooks.on_error(f"Transcription error: {exc}")
         if hooks and hooks.on_state:
@@ -927,12 +1085,14 @@ def _transcribe_and_print(
     _debug(config, f"transcribed {len(audio)/sr:.1f}s in {asr_elapsed:.1f}s ({result.language})")
 
     if result.is_empty:
+        _json_emit(config, {"type": "dropped", "utterance_id": utterance_id, "reason": "empty_result", "duration_sec": round(len(audio) / sr, 3)})
         return
 
-    raw = result.text
-    norm = _normalize_text(raw)
+    asr_text = result.text  # Preserve original ASR output for raw event & history
+
     # Filter common whisper silence hallucinations (e.g. "thank you")
-    # when the captured segment has very low energy.
+    # BEFORE dictionary replacements so dict can't mask a hallucination.
+    norm = _normalize_text(asr_text)
     if norm in _SILENCE_HALLUCINATIONS:
         seg_rms = compute_rms(audio)
         seg_dur = len(audio) / sr
@@ -947,39 +1107,58 @@ def _transcribe_and_print(
                 },
             )
             return
+
+    raw = asr_text
+
+    # Layer 1: Exact dictionary replacements (regex word-boundary)
+    try:
+        raw_before = raw
+        raw = get_store().apply_dictionary_replacements(raw)
+        if raw != raw_before:
+            _debug(config, f"dict exact: {raw_before!r} -> {raw!r}")
+    except Exception as exc:
+        logger.warning("Dictionary exact replacement failed: %s", exc)
+
+    # Layer 2: Fuzzy phonetic matching (Levenshtein ratio)
+    try:
+        raw_before = raw
+        raw = get_store().apply_fuzzy_replacements(raw)
+        if raw != raw_before:
+            _debug(config, f"dict fuzzy: {raw_before!r} -> {raw!r}")
+    except Exception as exc:
+        logger.warning("Dictionary fuzzy replacement failed: %s", exc)
+
     # Don't duplicate partial output if the final raw matches what we already showed
     if partials and raw.strip() == partials[-1].strip():
         _echo(f"\n[final] {raw}  ← confirmed")
     else:
         _echo(f"\n[raw] {raw}")
-    _json_emit(config, {"type": "raw", "text": raw, "utterance_id": utterance_id})
+    _json_emit(config, {"type": "raw", "text": asr_text, "utterance_id": utterance_id})
     if hooks and hooks.on_raw:
-        hooks.on_raw(raw)
+        hooks.on_raw(asr_text)
 
     # --- LLM (no semaphore held — next utterance can start ASR in parallel) ---
     word_count = len(raw.split())
     if config.llm.mode is LLMMode.OFF or word_count <= 5:
         # Skip LLM for very short utterances (saves 2-3s per "Hi", "Ok", etc.)
         _json_emit(config, {"type": "processed", "text": raw, "utterance_id": utterance_id})
-        _copy_and_sep(config, raw)
         if hooks and hooks.on_processed:
             hooks.on_processed(raw)
-        if hooks and hooks.on_state:
-            hooks.on_state("copied")
+        if not hooks:
+            _output_text(raw, config)
         total_elapsed = time.monotonic() - ts_total
         telemetry.record("total", total_elapsed)
-        get_store().write_async(raw, raw, mode="off" if config.llm.mode is LLMMode.OFF else "short", duration_sec=total_elapsed)
+        get_store().write_async(asr_text, raw, mode="off" if config.llm.mode is LLMMode.OFF else "short", duration_sec=total_elapsed)
         return
 
     _debug(config, f"LLM: mode={config.llm.mode.value}")
     _json_emit(config, {"type": "state", "state": "rewriting", "utterance_id": utterance_id})
     if hooks and hooks.on_state:
         hooks.on_state("rewriting")
-    if hooks and hooks.on_activity:
-        hooks.on_activity(f"Rewriting ({config.llm.mode.value})")
 
     # Build few-shot context from past corrected transcripts (latency-gated)
     few_shot_context = ""
+    dict_llm_context = ""
     try:
         store = get_store()
         candidates = store.recent_cleanups(limit=20)
@@ -989,6 +1168,10 @@ def _transcribe_and_print(
             ctx_ms = (time.monotonic() - before_ctx) * 1000
             if few_shot_context:
                 _debug(config, f"few-shot: {ctx_ms:.0f}ms embedding latency")
+        # Build dictionary context for LLM (Layer 3)
+        dict_llm_context = store.build_dict_llm_context()
+        if dict_llm_context:
+            _debug(config, f"dict LLM context: {len(dict_llm_context)} chars")
     except Exception:
         pass
 
@@ -996,7 +1179,7 @@ def _transcribe_and_print(
     try:
         collected: list[str] = []
         with _llm_semaphore:
-            for token in rewrite_stream(raw, config.llm, few_shot_context=few_shot_context):
+            for token in rewrite_stream(raw, config.llm, few_shot_context=few_shot_context, dictionary_context=dict_llm_context):
                 if token:
                     collected.append(token)
                     sys.stdout.write(token)
@@ -1019,14 +1202,13 @@ def _transcribe_and_print(
         if hooks and hooks.on_state:
             hooks.on_state("error")
 
-    _copy_and_sep(config, processed)
     if hooks and hooks.on_processed:
         hooks.on_processed(processed)
-    if hooks and hooks.on_state:
-        hooks.on_state("copied")
+    if not hooks:
+        _output_text(processed, config)
     total_elapsed = time.monotonic() - ts_total
     telemetry.record("total", total_elapsed)
-    get_store().write_async(raw, processed, mode=config.llm.mode.value, duration_sec=total_elapsed)
+    get_store().write_async(asr_text, processed, mode=config.llm.mode.value, duration_sec=total_elapsed)
 
 
 def _transcribe_with_partials(
@@ -1061,45 +1243,84 @@ def _transcribe_with_partials(
         return TranscriptionResult(text="", language="")
 
     if tcfg.backend is TranscriptionBackend.WHISPER_CPP:
-        # --- whisper.cpp with partial callback ---
-        model = _get_cpp_model(tcfg)
+        # --- whisper.cpp via subprocess (crash isolation) ---
+        # A native segfault in whisper.cpp kills the entire process. Running it
+        # in a subprocess lets us survive and report the error properly.
+        import json as _json
+        import os
+        import sys as _sys
+        import tempfile as _tempfile
 
-        def _cpp_callback(seg):
-            """pywhispercpp user callback receives one Segment."""
-            text = seg.text.decode("utf-8") if isinstance(seg.text, bytes) else str(seg.text)
-            on_partial(text)
+        audio_path = None
+        try:
+            fd, audio_path = _tempfile.mkstemp(suffix=".npy")
+            os.close(fd)
+            np.save(audio_path, audio, allow_pickle=False)
 
-        raw_segments = model.transcribe(
-            audio,
-            n_threads=tcfg.cpu_threads,
-            no_context=not tcfg.condition_on_previous_text,
-            single_segment=True,
-            language=tcfg.language or "",
-            new_segment_callback=_cpp_callback,
-            temperature=0.0,
-            temperature_inc=0.2,
-            no_speech_thold=tcfg.whisper_no_speech_thold,
-            entropy_thold=tcfg.whisper_entropy_thold,
-            logprob_thold=tcfg.whisper_logprob_thold,
-            suppress_non_speech_tokens=True,
-            suppress_blank=True,
-            greedy={"best_of": 5},
-        )
+            worker_cfg = {
+                "model_name": tcfg.model_name,
+                "audio_path": audio_path,
+                "n_threads": tcfg.cpu_threads,
+                "language": tcfg.language or "",
+                "condition_on_previous_text": tcfg.condition_on_previous_text,
+                "no_speech_thold": tcfg.whisper_no_speech_thold,
+                "entropy_thold": tcfg.whisper_entropy_thold,
+                "logprob_thold": tcfg.whisper_logprob_thold,
+                "hotwords": tcfg.hotwords or "",
+            }
 
-        segments: list[TranscriptionSegment] = []
-        text_parts: list[str] = []
-        for seg in raw_segments:
-            text = seg.text.strip() if isinstance(seg.text, str) else seg.text.decode("utf-8").strip()
-            if not text or text in _JUNK_TOKENS:
-                continue
-            segments.append(TranscriptionSegment(text=text, start=seg.t0 * 0.01, end=seg.t1 * 0.01))
-            text_parts.append(text)
+            if getattr(_sys, "frozen", False):
+                # PyInstaller frozen binary: sys.executable is the frozen binary,
+                # can't use `-m stt._cpp_worker`. Run worker logic in-process.
+                from stt._cpp_worker import run_worker
+                result = run_worker(worker_cfg)
+            else:
+                import subprocess as _subprocess
+                proc = _subprocess.run(
+                    [_sys.executable, "-u", "-m", "stt._cpp_worker"],
+                    input=_json.dumps(worker_cfg),
+                    capture_output=True,
+                    text=True,
+                    timeout=120,
+                )
 
-        return TranscriptionResult(
-            text=" ".join(text_parts),
-            language=tcfg.language or "",
-            segments=tuple(segments),
-        )
+                if proc.returncode != 0:
+                    stderr_tail = (proc.stderr or "")[-500:]
+                    raise RuntimeError(
+                        f"whisper.cpp worker crashed (exit {proc.returncode}): {stderr_tail}"
+                    )
+
+                result = _json.loads(proc.stdout)
+
+            if not result.get("ok"):
+                raise RuntimeError(result.get("error", "whisper.cpp worker returned error"))
+
+            text = result.get("text", "")
+            if text:
+                on_partial(text)  # NOTE: whisper.cpp fires one partial with complete text (no streaming partials)
+
+            segments: list[TranscriptionSegment] = []
+            for s in result.get("segments", []):
+                t = s.get("text", "").strip()
+                if t and t not in _JUNK_TOKENS:
+                    segments.append(TranscriptionSegment(text=t, start=s["start"], end=s["end"]))
+
+            return TranscriptionResult(
+                text=text,
+                language=result.get("language", "") or (tcfg.language or ""),
+                segments=tuple(segments),
+            )
+
+        except Exception as exc:
+            if "timed out" in str(exc).lower():
+                raise RuntimeError("whisper.cpp transcription timed out (120s)") from exc
+            raise
+        finally:
+            if audio_path and os.path.exists(audio_path):
+                try:
+                    os.unlink(audio_path)
+                except OSError:
+                    pass
     else:
         # --- faster-whisper: yield segments incrementally ---
         model = _get_fw_model(tcfg)
@@ -1132,25 +1353,6 @@ def _transcribe_with_partials(
             segments=tuple(segments),
         )
 
-
-def _copy_and_sep(config: AppConfig, text: str) -> None:
-    """Type text and/or copy to clipboard in parallel for minimum latency."""
-    typed = [False]
-    copied = [False]
-    threads: list[threading.Thread] = []
-    if config.typing.enabled:
-        threads.append(threading.Thread(target=lambda: typed.__setitem__(0, type_to_focused_input(text, config.typing)), daemon=True))
-    if config.clipboard.enabled:
-        threads.append(threading.Thread(target=lambda: copied.__setitem__(0, copy_to_clipboard(text, config.clipboard)), daemon=True))
-    for t in threads:
-        t.start()
-    for t in threads:
-        t.join(timeout=10)
-    if typed[0]:
-        _echo("[typed] ✓")
-    if copied[0]:
-        _echo("[clipboard] ✓")
-    _echo("-" * 40)
 
 
 # ---------------------------------------------------------------------------

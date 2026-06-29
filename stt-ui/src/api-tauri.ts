@@ -2,14 +2,12 @@
 import { type STTApi, type STTEvent } from "./api";
 import type { Child } from "@tauri-apps/plugin-shell";
 
-interface WebAudioCapture {
+let webAudioCapture: {
   stream: MediaStream;
   audioContext: AudioContext;
   source: MediaStreamAudioSourceNode;
   analyser: AnalyserNode;
-}
-
-let webAudioCapture: WebAudioCapture | null = null;
+} | null = null;
 
 export async function requestWebAudioCapture(): Promise<boolean> {
   try {
@@ -19,7 +17,6 @@ export async function requestWebAudioCapture(): Promise<boolean> {
     const analyser = audioContext.createAnalyser();
     analyser.fftSize = 256;
     source.connect(analyser);
-
     webAudioCapture = { stream, audioContext, source, analyser };
     return true;
   } catch (err) {
@@ -48,17 +45,20 @@ export function createTauriApi(args: string[], sidecarName: string = "binaries/s
     for (const cb of listeners) cb({ type: "error", message: msg });
   };
 
-  const handleLine = (source: string, line: string) => {
-    const trimmed = line.trim();
-    if (!trimmed) return;
-    try {
-      const event: STTEvent = JSON.parse(trimmed);
-      for (const cb of listeners) cb(event);
-    } catch {
-      if (source === "stderr") {
-        console.warn(`[Sidecar stderr] ${trimmed}`);
-      } else {
-        console.log(`[Sidecar stdout] ${trimmed}`);
+  const handleLine = (source: string, data: string) => {
+    const lines = data.split("\n");
+    for (const raw of lines) {
+      const trimmed = raw.trim();
+      if (!trimmed) continue;
+      try {
+        const event: STTEvent = JSON.parse(trimmed);
+        for (const cb of listeners) cb(event);
+      } catch {
+        if (source === "stderr") {
+          console.warn(`[Sidecar stderr] ${trimmed}`);
+        } else {
+          console.log(`[Sidecar stdout] ${trimmed}`);
+        }
       }
     }
   };
@@ -66,7 +66,7 @@ export function createTauriApi(args: string[], sidecarName: string = "binaries/s
   return {
     onEvent(cb) { listeners.push(cb); },
 
-    async start() {
+    async spawn() {
       const { Command } = await import("@tauri-apps/plugin-shell");
       const cmd = Command.sidecar(sidecarName, args);
       cmd.stdout.on("data", (line: string) => handleLine("stdout", line));
@@ -78,15 +78,36 @@ export function createTauriApi(args: string[], sidecarName: string = "binaries/s
         notifyError(`Sidecar error: ${err}`);
       });
       child = await cmd.spawn();
+      console.log("[Engine] Sidecar spawned — models loading, engine warming...");
     },
 
-    stop() {
+    kill() {
       listeners = [];
       if (child) {
         try { child.kill(); } catch { }
         child = null;
+        console.log("[Engine] Sidecar killed");
+      }
+    },
+
+    start() {
+      this.sendCommand({ type: "start_recording" });
+      console.log("[PTT] Sent start_recording");
+    },
+
+    stop() {
+      this.sendCommand({ type: "stop_recording" });
+      console.log("[PTT] Sent stop_recording");
+    },
+
+    sendCommand(cmd: Record<string, unknown>) {
+      if (child) {
+        try {
+          child.write(JSON.stringify(cmd) + "\n");
+        } catch (e) {
+          console.warn("[Engine] Failed to write command:", e);
+        }
       }
     },
   };
 }
-

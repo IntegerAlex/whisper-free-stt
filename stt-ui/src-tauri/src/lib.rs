@@ -1,4 +1,6 @@
 mod widget;
+#[cfg(test)]
+mod tests;
 
 use rusqlite::Connection;
 use serde::Serialize;
@@ -48,6 +50,20 @@ struct TranscriptRow {
     created_at: String,
 }
 
+#[derive(Debug, Serialize)]
+struct DictionaryEntry {
+    id: i64,
+    phrase: String,
+    replacement: String,
+    category: String,
+    notes: String,
+    use_count: i64,
+    is_favorite: bool,
+    auto_learned: bool,
+    created_at: String,
+    updated_at: String,
+}
+
 // ---------------------------------------------------------------------------
 // Commands
 // ---------------------------------------------------------------------------
@@ -93,6 +109,743 @@ async fn get_history(limit: usize) -> Result<Vec<TranscriptRow>, AppError> {
     })
     .await??;
     Ok(rows)
+}
+
+// ---------------------------------------------------------------------------
+// Insights types & command
+// ---------------------------------------------------------------------------
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct InsightsCategory {
+    name: String,
+    words: i64,
+    max_words: i64,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct InsightsStreak {
+    current: i64,
+    longest: i64,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct InsightsHeatmapDay {
+    date: String,
+    level: i64,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct InsightsData {
+    wpm: i64,
+    wpm_trend: i64,
+    total_words: i64,
+    words_this_week: i64,
+    words_trend: i64,
+    ai_fixes: i64,
+    categories: Vec<InsightsCategory>,
+    streak: InsightsStreak,
+    heatmap: Vec<InsightsHeatmapDay>,
+    weekly_words: Vec<WeeklyWordDay>,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct WeeklyWordDay {
+    label: String,
+    words: i64,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct VoiceIntelligenceData {
+    most_active_day: String,
+    most_productive_hour: String,
+    avg_dictation_length: String,
+    most_used_language: String,
+    most_active_day_words: i64,
+    peak_voice_usage: String,
+    per_utterance: String,
+    language_percentage: i64,
+}
+
+#[tauri::command]
+async fn get_insights() -> Result<InsightsData, AppError> {
+    let db_path = history_db_path()?;
+    let data = tauri::async_runtime::spawn_blocking(move || {
+        let conn = Connection::open(&db_path)?;
+
+        // Total words (all time)
+        let total_words: i64 = conn
+            .query_row(
+                "SELECT COALESCE(SUM(LENGTH(raw_text) - LENGTH(REPLACE(raw_text, ' ', '')) + 1), 0) FROM transcripts WHERE raw_text != ''",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap_or(0);
+
+        // Words this week
+        let words_this_week: i64 = conn
+            .query_row(
+                "SELECT COALESCE(SUM(LENGTH(raw_text) - LENGTH(REPLACE(raw_text, ' ', '')) + 1), 0) FROM transcripts WHERE raw_text != '' AND created_at >= datetime('now', '-7 days')",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap_or(0);
+
+        // Words last week
+        let words_prev_week: i64 = conn
+            .query_row(
+                "SELECT COALESCE(SUM(LENGTH(raw_text) - LENGTH(REPLACE(raw_text, ' ', '')) + 1), 0) FROM transcripts WHERE raw_text != '' AND created_at >= datetime('now', '-14 days') AND created_at < datetime('now', '-7 days')",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap_or(0);
+
+        // WPM
+        let wpm: i64 = conn
+            .query_row(
+                "SELECT COALESCE(AVG((LENGTH(raw_text) - LENGTH(REPLACE(raw_text, ' ', '')) + 1) / MAX(duration_sec / 60.0, 0.001)), 0) FROM transcripts WHERE raw_text != '' AND duration_sec > 0",
+                [],
+                |r| r.get::<_, f64>(0).map(|v| v as i64),
+            )
+            .unwrap_or(0);
+
+        // WPM this week
+        let wpm_now: i64 = conn
+            .query_row(
+                "SELECT COALESCE(AVG((LENGTH(raw_text) - LENGTH(REPLACE(raw_text, ' ', '')) + 1) / MAX(duration_sec / 60.0, 0.001)), 0) FROM transcripts WHERE raw_text != '' AND duration_sec > 0 AND created_at >= datetime('now', '-7 days')",
+                [],
+                |r| r.get::<_, f64>(0).map(|v| v as i64),
+            )
+            .unwrap_or(0);
+
+        // WPM last week
+        let wpm_prev: i64 = conn
+            .query_row(
+                "SELECT COALESCE(AVG((LENGTH(raw_text) - LENGTH(REPLACE(raw_text, ' ', '')) + 1) / MAX(duration_sec / 60.0, 0.001)), 0) FROM transcripts WHERE raw_text != '' AND duration_sec > 0 AND created_at >= datetime('now', '-14 days') AND created_at < datetime('now', '-7 days')",
+                [],
+                |r| r.get::<_, f64>(0).map(|v| v as i64),
+            )
+            .unwrap_or(0);
+
+        // AI fixes
+        let ai_fixes: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM transcripts WHERE processed_text != '' AND processed_text != raw_text AND mode != 'off'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap_or(0);
+
+        // Categories by mode
+        let mut categories = Vec::new();
+        {
+            let mut stmt = conn.prepare(
+                "SELECT mode, COALESCE(SUM(LENGTH(raw_text) - LENGTH(REPLACE(raw_text, ' ', '')) + 1), 0) as words FROM transcripts WHERE raw_text != '' AND mode != 'off' GROUP BY mode ORDER BY words DESC",
+            )?;
+            let rows = stmt.query_map([], |row| {
+                let mode: String = row.get(0)?;
+                let words: i64 = row.get(1)?;
+                Ok((mode, words))
+            })?;
+            let mode_map = |m: &str| -> &str {
+                match m {
+                    "cleanup" => "AI Prompts",
+                    "email" => "Emails",
+                    "bullet_list" => "Documents",
+                    "commit_message" => "Messages",
+                    _ => "Other",
+                }
+            };
+            for r in rows.flatten() {
+                let (mode, words) = r;
+                categories.push(InsightsCategory {
+                    name: mode_map(&mode).to_string(),
+                    words,
+                    max_words: total_words.max(1),
+                });
+            }
+            // Add uncategorized (mode='off') — merge into existing "Other" if present
+            let other_words: i64 = conn
+                .query_row(
+                    "SELECT COALESCE(SUM(LENGTH(raw_text) - LENGTH(REPLACE(raw_text, ' ', '')) + 1), 0) FROM transcripts WHERE raw_text != '' AND mode = 'off'",
+                    [],
+                    |r| r.get(0),
+                )
+                .unwrap_or(0);
+            if other_words > 0 {
+                if let Some(existing) = categories.iter_mut().find(|c| c.name == "Other") {
+                    existing.words += other_words;
+                } else {
+                    categories.push(InsightsCategory {
+                        name: "Other".to_string(),
+                        words: other_words,
+                        max_words: total_words.max(1),
+                    });
+                }
+            }
+        }
+
+        // Streak: consecutive days with at least one transcript
+        let (current_streak, longest_streak) = {
+            // Get all distinct days with transcripts, ordered descending
+            let dates: Vec<String> = {
+                let mut stmt = conn.prepare(
+                    "SELECT DISTINCT date(created_at) as day FROM transcripts ORDER BY day DESC",
+                )?;
+                let rows = stmt.query_map([], |row| row.get::<_, String>(0))?;
+                rows.filter_map(|r| r.ok()).collect()
+            };
+
+            let day_set: std::collections::HashSet<&str> = dates.iter().map(|s| s.as_str()).collect();
+
+            // Current streak: count backwards from today using SQLite date functions
+            let current = {
+                let mut count = 0i64;
+                // Manual date stepping using SQLite
+                for offset in 0..2000i64 {
+                    let check: String = conn
+                        .query_row(
+                            "SELECT date('now', '-' || ?1 || ' days')",
+                            [offset],
+                            |r| r.get(0),
+                        )
+                        .unwrap_or_default();
+                    if day_set.contains(check.as_str()) {
+                        count += 1;
+                    } else {
+                        break;
+                    }
+                }
+                count
+            };
+
+            // Longest streak: scan all sorted dates
+            let mut longest = 0i64;
+            let mut temp = 1i64;
+            for i in 1..dates.len() {
+                // Use SQLite to check if dates are consecutive
+                let diff: i64 = conn
+                    .query_row(
+                        "SELECT julianday(?1) - julianday(?2)",
+                        [&dates[i - 1], &dates[i]],
+                        |r| r.get(0),
+                    )
+                    .unwrap_or(0);
+                if diff == 1 {
+                    temp += 1;
+                } else {
+                    longest = longest.max(temp);
+                    temp = 1;
+                }
+            }
+            longest = longest.max(temp);
+
+            (current, longest)
+        };
+
+        // Heatmap: transcripts per day for last 182 days (fill zero-activity days)
+        let heatmap = {
+            let mut activity_map = std::collections::HashMap::new();
+            let mut stmt = conn.prepare(
+                "SELECT date(created_at) as day, COUNT(*) as cnt FROM transcripts WHERE created_at >= datetime('now', '-182 days') GROUP BY day",
+            )?;
+            let rows = stmt.query_map([], |row| {
+                let day: String = row.get(0)?;
+                let cnt: i64 = row.get(1)?;
+                Ok((day, cnt))
+            })?;
+            for r in rows.flatten() {
+                activity_map.insert(r.0, r.1);
+            }
+            let mut heatmap = Vec::new();
+            for offset in (0..182i64).rev() {
+                let day: String = conn
+                    .query_row("SELECT date('now', '-' || ?1 || ' days')", [offset], |r| r.get(0))
+                    .unwrap_or_default();
+                let cnt = activity_map.get(&day).copied().unwrap_or(0);
+                let level = match cnt {
+                    0 => 0,
+                    1..=2 => 1,
+                    3..=5 => 2,
+                    6..=10 => 3,
+                    _ => 4,
+                };
+                heatmap.push(InsightsHeatmapDay { date: day, level });
+            }
+            heatmap
+        };
+
+        // Trend percentages
+        let wpm_trend = if wpm_prev > 0 {
+            ((wpm_now - wpm_prev) as f64 / wpm_prev as f64 * 100.0).round() as i64
+        } else {
+            0
+        };
+        let words_trend = if words_prev_week > 0 {
+            ((words_this_week - words_prev_week) as f64 / words_prev_week as f64 * 100.0).round() as i64
+        } else {
+            0
+        };
+
+        // Weekly word counts per day (last 7 days) for bar chart
+        let weekly_words = {
+            let day_names = ["Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"];
+            let mut result = Vec::new();
+            for offset in (0..7i64).rev() {
+                let day: String = conn
+                    .query_row(
+                        "SELECT date('now', '-' || ?1 || ' days')",
+                        [offset],
+                        |r| r.get(0),
+                    )
+                    .unwrap_or_default();
+                let words: i64 = conn
+                    .query_row(
+                        "SELECT COALESCE(SUM(LENGTH(raw_text) - LENGTH(REPLACE(raw_text, ' ', '')) + 1), 0) FROM transcripts WHERE raw_text != '' AND date(created_at) = ?1",
+                        [&day],
+                        |r| r.get(0),
+                    )
+                    .unwrap_or(0);
+                // Convert to day-of-week name
+                let dow: String = conn
+                    .query_row("SELECT strftime('%w', ?1)", [&day], |r| r.get(0))
+                    .unwrap_or_default();
+                let idx = dow.parse::<usize>().unwrap_or(0);
+                result.push(WeeklyWordDay {
+                    label: day_names[idx].to_string(),
+                    words,
+                });
+            }
+            result
+        };
+
+        Ok::<InsightsData, AppError>(InsightsData {
+            wpm,
+            wpm_trend,
+            total_words,
+            words_this_week,
+            words_trend,
+            ai_fixes,
+            categories,
+            streak: InsightsStreak {
+                current: current_streak,
+                longest: longest_streak,
+            },
+            heatmap,
+            weekly_words,
+        })
+    })
+    .await??;
+    Ok(data)
+}
+
+#[tauri::command]
+async fn get_voice_intelligence() -> Result<VoiceIntelligenceData, AppError> {
+    let db_path = history_db_path()?;
+    let data = tauri::async_runtime::spawn_blocking(move || {
+        let conn = Connection::open(&db_path)?;
+
+        // Most active day of week
+        let (most_active_day, most_active_day_words): (String, i64) = conn
+            .query_row(
+                "SELECT CASE CAST(strftime('%w', created_at) AS INTEGER) \
+                 WHEN 0 THEN 'Sunday' WHEN 1 THEN 'Monday' WHEN 2 THEN 'Tuesday' \
+                 WHEN 3 THEN 'Wednesday' WHEN 4 THEN 'Thursday' WHEN 5 THEN 'Friday' \
+                 ELSE 'Saturday' END, \
+                 COALESCE(SUM(LENGTH(raw_text) - LENGTH(REPLACE(raw_text, ' ', '')) + 1), 0) \
+                 FROM transcripts WHERE raw_text != '' GROUP BY strftime('%w', created_at) ORDER BY 2 DESC LIMIT 1",
+                [],
+                |r| Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)?)),
+            )
+            .unwrap_or(("—".into(), 0));
+
+        // Most productive hour
+        let (most_productive_hour, peak_sessions): (i64, i64) = conn
+            .query_row(
+                "SELECT CAST(strftime('%H', created_at) AS INTEGER) as h, COUNT(*) as cnt \
+                 FROM transcripts GROUP BY h ORDER BY cnt DESC LIMIT 1",
+                [],
+                |r| Ok((r.get::<_, i64>(0)?, r.get::<_, i64>(1)?)),
+            )
+            .unwrap_or((0, 0));
+        let hour_label = match most_productive_hour {
+            0 => "12 AM".into(),
+            1..=11 => format!("{} AM", most_productive_hour),
+            12 => "12 PM".into(),
+            13..=23 => format!("{} PM", most_productive_hour - 12),
+            _ => "—".into(),
+        };
+
+        // Average dictation length
+        let avg_duration: f64 = conn
+            .query_row(
+                "SELECT COALESCE(AVG(duration_sec), 0) FROM transcripts WHERE duration_sec > 0",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap_or(0.0);
+        let avg_dictation = if avg_duration > 0.0 {
+            if avg_duration < 60.0 {
+                format!("{:.0} seconds", avg_duration)
+            } else {
+                format!("{:.1} minutes", avg_duration / 60.0)
+            }
+        } else {
+            "—".into()
+        };
+
+        // Most used language
+        let (most_used_lang, lang_sessions): (String, i64) = conn
+            .query_row(
+                "SELECT language, COUNT(*) as cnt FROM transcripts \
+                 WHERE language != '' GROUP BY language ORDER BY cnt DESC LIMIT 1",
+                [],
+                |r| Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)?)),
+            )
+            .unwrap_or(("—".into(), 0));
+        let total_sessions: i64 = conn
+            .query_row("SELECT COUNT(*) FROM transcripts WHERE language != ''", [], |r| r.get(0))
+            .unwrap_or(0);
+        let language_pct = if total_sessions > 0 {
+            (lang_sessions as f64 / total_sessions as f64 * 100.0).round() as i64
+        } else {
+            0
+        };
+
+        Ok::<VoiceIntelligenceData, AppError>(VoiceIntelligenceData {
+            most_active_day,
+            most_productive_hour: hour_label,
+            avg_dictation_length: avg_dictation,
+            most_used_language: most_used_lang,
+            most_active_day_words,
+            peak_voice_usage: format!("{} sessions", peak_sessions),
+            per_utterance: if avg_duration > 0.0 { format!("Avg {:.1}s", avg_duration) } else { "No data".into() },
+            language_percentage: language_pct,
+        })
+    })
+    .await??;
+    Ok(data)
+}
+
+// ---------------------------------------------------------------------------
+// Dictionary commands
+// ---------------------------------------------------------------------------
+
+fn ensure_dict_table(conn: &Connection) -> Result<(), rusqlite::Error> {
+    conn.execute_batch(
+        "CREATE TABLE IF NOT EXISTS dictionary_entries (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            phrase TEXT NOT NULL UNIQUE,
+            replacement TEXT NOT NULL,
+            category TEXT DEFAULT 'custom',
+            notes TEXT DEFAULT '',
+            use_count INTEGER DEFAULT 0,
+            is_favorite INTEGER DEFAULT 0,
+            auto_learned INTEGER DEFAULT 0,
+            created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+            updated_at DATETIME DEFAULT CURRENT_TIMESTAMP
+        );",
+    )
+}
+
+#[tauri::command]
+async fn get_dictionary(
+    search: Option<String>,
+    category: Option<String>,
+    favorite: Option<bool>,
+) -> Result<Vec<DictionaryEntry>, AppError> {
+    let db_path = history_db_path()?;
+    let rows = tauri::async_runtime::spawn_blocking(move || {
+        let conn = Connection::open(db_path)?;
+        ensure_dict_table(&conn)?;
+
+        let sql = "SELECT id, phrase, replacement, category, notes, use_count, is_favorite, auto_learned, created_at, updated_at
+             FROM dictionary_entries ORDER BY is_favorite DESC, updated_at DESC";
+        let mut stmt = conn.prepare(sql)?;
+        let rows = stmt
+            .query_map([], |row| {
+                Ok(DictionaryEntry {
+                    id: row.get(0)?,
+                    phrase: row.get(1)?,
+                    replacement: row.get(2)?,
+                    category: row.get(3)?,
+                    notes: row.get(4)?,
+                    use_count: row.get(5)?,
+                    is_favorite: row.get::<_, i64>(6)? != 0,
+                    auto_learned: row.get::<_, i64>(7)? != 0,
+                    created_at: row.get(8)?,
+                    updated_at: row.get(9)?,
+                })
+            })?
+            .collect::<Result<Vec<_>, _>>()?;
+
+        // Filter in-memory (simpler than dynamic SQL on rusqlite)
+        let rows: Vec<DictionaryEntry> = rows.into_iter()
+            .filter(|r| {
+                if let Some(ref s) = search {
+                    if !s.trim().is_empty() && !r.phrase.to_lowercase().contains(&s.trim().to_lowercase()) {
+                        return false;
+                    }
+                }
+                if let Some(ref cat) = category {
+                    if !cat.trim().is_empty() && r.category != cat.trim() {
+                        return false;
+                    }
+                }
+                if favorite.unwrap_or(false) && !r.is_favorite {
+                    return false;
+                }
+                true
+            })
+            .collect();
+
+        Ok::<Vec<DictionaryEntry>, AppError>(rows)
+    })
+    .await??;
+    Ok(rows)
+}
+
+#[tauri::command]
+async fn add_dictionary_entry(
+    phrase: String,
+    replacement: String,
+    category: Option<String>,
+    notes: Option<String>,
+) -> Result<Option<DictionaryEntry>, AppError> {
+    let db_path = history_db_path()?;
+    let result = tauri::async_runtime::spawn_blocking(move || {
+        let conn = Connection::open(db_path)?;
+        ensure_dict_table(&conn)?;
+
+        let phrase = phrase.trim();
+        let replacement = replacement.trim();
+        if phrase.is_empty() || replacement.is_empty() || phrase.len() > 60 || replacement.len() > 60 {
+            return Ok::<Option<DictionaryEntry>, AppError>(None);
+        }
+
+        let cat = category.unwrap_or_else(|| "custom".into());
+        let nts = notes.unwrap_or_default();
+
+        conn.execute(
+            "INSERT OR IGNORE INTO dictionary_entries (phrase, replacement, category, notes) VALUES (?1, ?2, ?3, ?4)",
+            rusqlite::params![phrase, replacement, cat, nts],
+        )?;
+
+        let last_id = conn.last_insert_rowid();
+        if last_id == 0 {
+            return Ok(None);
+        }
+
+        let mut stmt = conn.prepare(
+            "SELECT id, phrase, replacement, category, notes, use_count, is_favorite, auto_learned, created_at, updated_at
+             FROM dictionary_entries WHERE id = ?1",
+        )?;
+        let entry = stmt.query_row([last_id], |row| {
+            Ok(DictionaryEntry {
+                id: row.get(0)?,
+                phrase: row.get(1)?,
+                replacement: row.get(2)?,
+                category: row.get(3)?,
+                notes: row.get(4)?,
+                use_count: row.get(5)?,
+                is_favorite: row.get::<_, i64>(6)? != 0,
+                auto_learned: row.get::<_, i64>(7)? != 0,
+                created_at: row.get(8)?,
+                updated_at: row.get(9)?,
+            })
+        })?;
+        Ok(Some(entry))
+    })
+    .await??;
+    Ok(result)
+}
+
+#[tauri::command]
+async fn update_dictionary_entry(
+    id: i64,
+    phrase: Option<String>,
+    replacement: Option<String>,
+    category: Option<String>,
+    notes: Option<String>,
+) -> Result<Option<DictionaryEntry>, AppError> {
+    let db_path = history_db_path()?;
+    let result = tauri::async_runtime::spawn_blocking(move || {
+        let conn = Connection::open(db_path)?;
+        ensure_dict_table(&conn)?;
+
+        if let Some(ref p) = phrase {
+            if !p.trim().is_empty() && p.trim().len() <= 60 {
+                conn.execute("UPDATE dictionary_entries SET phrase = ?1, updated_at = CURRENT_TIMESTAMP WHERE id = ?2",
+                    rusqlite::params![p.trim(), id])?;
+            }
+        }
+        if let Some(ref r) = replacement {
+            if !r.trim().is_empty() && r.trim().len() <= 60 {
+                conn.execute("UPDATE dictionary_entries SET replacement = ?1, updated_at = CURRENT_TIMESTAMP WHERE id = ?2",
+                    rusqlite::params![r.trim(), id])?;
+            }
+        }
+        if let Some(ref cat) = category {
+            if !cat.trim().is_empty() {
+                conn.execute("UPDATE dictionary_entries SET category = ?1, updated_at = CURRENT_TIMESTAMP WHERE id = ?2",
+                    rusqlite::params![cat, id])?;
+            }
+        }
+        if let Some(ref n) = notes {
+            conn.execute("UPDATE dictionary_entries SET notes = ?1, updated_at = CURRENT_TIMESTAMP WHERE id = ?2",
+                rusqlite::params![n, id])?;
+        }
+
+        let mut stmt = conn.prepare(
+            "SELECT id, phrase, replacement, category, notes, use_count, is_favorite, auto_learned, created_at, updated_at
+             FROM dictionary_entries WHERE id = ?1",
+        )?;
+        let entry = stmt.query_row([id], |row| {
+            Ok(DictionaryEntry {
+                id: row.get(0)?,
+                phrase: row.get(1)?,
+                replacement: row.get(2)?,
+                category: row.get(3)?,
+                notes: row.get(4)?,
+                use_count: row.get(5)?,
+                is_favorite: row.get::<_, i64>(6)? != 0,
+                auto_learned: row.get::<_, i64>(7)? != 0,
+                created_at: row.get(8)?,
+                updated_at: row.get(9)?,
+            })
+        })?;
+        Ok::<Option<DictionaryEntry>, AppError>(Some(entry))
+    })
+    .await??;
+    Ok(result)
+}
+
+#[tauri::command]
+async fn delete_dictionary_entry(id: i64) -> Result<bool, AppError> {
+    let db_path = history_db_path()?;
+    let ok = tauri::async_runtime::spawn_blocking(move || {
+        let conn = Connection::open(db_path)?;
+        ensure_dict_table(&conn)?;
+        conn.execute("DELETE FROM dictionary_entries WHERE id = ?1", [id])?;
+        Ok::<bool, AppError>(true)
+    })
+    .await??;
+    Ok(ok)
+}
+
+#[tauri::command]
+async fn toggle_dictionary_favorite(id: i64) -> Result<Option<bool>, AppError> {
+    let db_path = history_db_path()?;
+    let result = tauri::async_runtime::spawn_blocking(move || {
+        let conn = Connection::open(db_path)?;
+        ensure_dict_table(&conn)?;
+
+        let current: i64 = conn.query_row(
+            "SELECT is_favorite FROM dictionary_entries WHERE id = ?1",
+            [id],
+            |row| row.get(0),
+        )?;
+        let new_val = if current != 0 { 0 } else { 1 };
+        conn.execute(
+            "UPDATE dictionary_entries SET is_favorite = ?1, updated_at = CURRENT_TIMESTAMP WHERE id = ?2",
+            rusqlite::params![new_val, id],
+        )?;
+        Ok::<Option<bool>, AppError>(Some(new_val != 0))
+    })
+    .await??;
+    Ok(result)
+}
+
+#[tauri::command]
+async fn import_dictionary_csv(csv_text: String) -> Result<serde_json::Value, AppError> {
+    let db_path = history_db_path()?;
+    let result = tauri::async_runtime::spawn_blocking(move || {
+        let conn = Connection::open(db_path)?;
+        ensure_dict_table(&conn)?;
+
+        let mut imported: u32 = 0;
+        let mut skipped: u32 = 0;
+
+        let mut reader = csv::ReaderBuilder::new()
+            .has_headers(false)
+            .flexible(true)
+            .from_reader(csv_text.as_bytes());
+
+        for record in reader.records() {
+            if imported >= 1000 {
+                skipped += 1;
+                continue;
+            }
+            let row = match record {
+                Ok(r) => r,
+                Err(_) => {
+                    skipped += 1;
+                    continue;
+                }
+            };
+            let fields: Vec<&str> = row.iter().collect();
+            if fields.is_empty() || fields.iter().all(|f| f.trim().is_empty()) {
+                continue;
+            }
+            let phrase = fields[0].trim();
+            let replacement = if fields.len() >= 2 { fields[1].trim() } else { phrase };
+
+            if phrase.is_empty() || replacement.is_empty() || phrase.len() > 60 || replacement.len() > 60 {
+                skipped += 1;
+                continue;
+            }
+
+            match conn.execute(
+                "INSERT OR IGNORE INTO dictionary_entries (phrase, replacement) VALUES (?1, ?2)",
+                rusqlite::params![phrase, replacement],
+            ) {
+                Ok(1) => imported += 1,
+                _ => skipped += 1,
+            }
+        }
+
+        Ok::<serde_json::Value, AppError>(serde_json::json!({
+            "imported": imported,
+            "skipped": skipped,
+        }))
+    })
+    .await??;
+    Ok(result)
+}
+
+#[tauri::command]
+async fn export_dictionary_csv() -> Result<serde_json::Value, AppError> {
+    let db_path = history_db_path()?;
+    let result = tauri::async_runtime::spawn_blocking(move || {
+        let conn = Connection::open(db_path)?;
+        ensure_dict_table(&conn)?;
+
+        let mut stmt = conn.prepare(
+            "SELECT phrase, replacement FROM dictionary_entries ORDER BY is_favorite DESC, updated_at DESC",
+        )?;
+        let rows = stmt.query_map([], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+        })?;
+
+        let mut csv_lines = vec!["phrase,replacement".to_string()];
+        for row in rows {
+            let (phrase, replacement) = row?;
+            let escaped_p = phrase.replace('"', "\"\"");
+            let escaped_r = replacement.replace('"', "\"\"");
+            csv_lines.push(format!("\"{}\",\"{}\"", escaped_p, escaped_r));
+        }
+
+        Ok::<serde_json::Value, AppError>(serde_json::json!({
+            "csv": csv_lines.join("\n"),
+        }))
+    })
+    .await??;
+    Ok(result)
 }
 
 #[derive(Debug, Serialize)]
@@ -184,6 +937,272 @@ fn walk_dir_size(path: &std::path::Path) -> Result<u64, AppError> {
         }
     }
     Ok(total)
+}
+
+// ---------------------------------------------------------------------------
+// Win32 focus helpers — save/restore the foreground window around SendKeys
+// ---------------------------------------------------------------------------
+
+#[cfg(target_os = "windows")]
+mod win32 {
+    type HWND = *mut core::ffi::c_void;
+    extern "system" {
+        fn GetForegroundWindow() -> HWND;
+        fn SetForegroundWindow(hWnd: HWND) -> i32;
+        fn GetWindowThreadProcessId(hWnd: HWND, lpdwProcessId: *mut u32) -> u32;
+        fn GetCurrentThreadId() -> u32;
+        fn AttachThreadInput(idAttach: u32, idAttachTo: u32, fAttach: i32) -> i32;
+        fn keybd_event(bVk: u8, bScan: u8, dwFlags: u32, dwExtraInfo: usize);
+        fn SetClipboardData(uFormat: u32, hMem: *mut core::ffi::c_void) -> *mut core::ffi::c_void;
+        fn OpenClipboard(hWndNewOwner: HWND) -> i32;
+        fn EmptyClipboard() -> i32;
+        fn CloseClipboard() -> i32;
+        fn GlobalAlloc(uFlags: u32, dwBytes: usize) -> *mut core::ffi::c_void;
+        fn GlobalLock(hMem: *mut core::ffi::c_void) -> *mut core::ffi::c_void;
+        fn GlobalUnlock(hMem: *mut core::ffi::c_void) -> i32;
+        fn lstrcpyW(lpString1: *mut u16, lpString2: *const u16) -> *mut u16;
+    }
+
+    const KEYEVENTF_KEYUP: u32 = 0x0002;
+    const VK_CONTROL: u8 = 0x11;
+    const VK_V: u8 = 0x56;
+    const CF_UNICODETEXT: u32 = 13;
+    const GMEM_MOVEABLE: u32 = 0x0002;
+
+    /// Get the current foreground window handle as a number.
+    pub fn get_foreground_hwnd() -> u64 {
+        unsafe { GetForegroundWindow() as u64 }
+    }
+
+    /// Restore focus to a previously-saved window handle.
+    pub fn set_foreground_hwnd(hwnd: u64) -> bool {
+        if hwnd == 0 {
+            return false;
+        }
+        unsafe {
+            let target = hwnd as HWND;
+            let current_hwnd = GetForegroundWindow();
+            if current_hwnd == target {
+                return true;
+            }
+            let target_tid = GetWindowThreadProcessId(target, std::ptr::null_mut());
+            let current_tid = GetCurrentThreadId();
+            if target_tid == 0 || current_tid == 0 {
+                return false;
+            }
+            AttachThreadInput(current_tid, target_tid, 1);
+            let ok = SetForegroundWindow(target) != 0;
+            AttachThreadInput(current_tid, target_tid, 0);
+            ok
+        }
+    }
+
+    /// Set clipboard content using raw Win32 API (no PowerShell needed).
+    pub fn set_clipboard(text: &str) -> bool {
+        let wide: Vec<u16> = text.encode_utf16().chain(std::iter::once(0)).collect();
+        let byte_len = wide.len() * 2;
+        unsafe {
+            if OpenClipboard(std::ptr::null_mut()) == 0 {
+                return false;
+            }
+            EmptyClipboard();
+            let h_mem = GlobalAlloc(GMEM_MOVEABLE, byte_len);
+            if h_mem.is_null() {
+                CloseClipboard();
+                return false;
+            }
+            let ptr = GlobalLock(h_mem) as *mut u16;
+            if ptr.is_null() {
+                CloseClipboard();
+                return false;
+            }
+            lstrcpyW(ptr, wide.as_ptr());
+            GlobalUnlock(h_mem);
+            SetClipboardData(CF_UNICODETEXT, h_mem);
+            CloseClipboard();
+        }
+        true
+    }
+
+    /// Send Ctrl+V using keybd_event — works from any GUI process with an
+    /// active message loop (the Tauri app main thread).
+    pub fn send_ctrl_v() {
+        unsafe {
+            keybd_event(VK_CONTROL, 0, 0, 0);
+            keybd_event(VK_V, 0, 0, 0);
+            keybd_event(VK_V, 0, KEYEVENTF_KEYUP, 0);
+            keybd_event(VK_CONTROL, 0, KEYEVENTF_KEYUP, 0);
+        }
+    }
+}
+
+#[cfg(not(target_os = "windows"))]
+mod win32 {
+    /// Get the active window ID on Linux (X11 via xdotool, or 0 on Wayland).
+    pub fn get_foreground_hwnd() -> u64 {
+        let is_wayland = std::env::var("WAYLAND_DISPLAY").is_ok();
+        if is_wayland {
+            // Wayland has no cross-app window ID concept — return 0
+            return 0;
+        }
+        // X11: get active window ID via xdotool
+        if let Ok(output) = std::process::Command::new("xdotool")
+            .arg("getactivewindow")
+            .output()
+        {
+            if output.status.success() {
+                let s = String::from_utf8_lossy(&output.stdout).trim().to_string();
+                if let Ok(id) = s.parse::<u64>() {
+                    return id;
+                }
+            }
+        }
+        0
+    }
+
+    /// Restore focus to a previously-captured window on Linux.
+    pub fn set_foreground_hwnd(hwnd: u64) -> bool {
+        if hwnd == 0 {
+            return false;
+        }
+        let is_wayland = std::env::var("WAYLAND_DISPLAY").is_ok();
+        if is_wayland {
+            // Wayland cannot activate arbitrary windows
+            return false;
+        }
+        // X11: activate window via xdotool
+        std::process::Command::new("xdotool")
+            .args(["windowactivate", "--sync", &hwnd.to_string()])
+            .output()
+            .map(|o| o.status.success())
+            .unwrap_or(false)
+    }
+
+    /// Set clipboard content on Linux using wl-copy (Wayland) or xclip (X11).
+    pub fn set_clipboard(text: &str) -> bool {
+        let is_wayland = std::env::var("WAYLAND_DISPLAY").is_ok();
+        if is_wayland {
+            return std::process::Command::new("wl-copy")
+                .arg(text)
+                .output()
+                .map(|o| o.status.success())
+                .unwrap_or(false);
+        }
+        // X11: xclip reads from stdin
+        use std::io::Write;
+        let result = std::process::Command::new("xclip")
+            .args(["-selection", "clipboard"])
+            .stdin(std::process::Stdio::piped())
+            .spawn()
+            .and_then(|mut child| {
+                if let Some(ref mut stdin) = child.stdin {
+                    stdin.write_all(text.as_bytes())?;
+                }
+                drop(child.stdin.take());
+                child.wait()
+            });
+        result.map(|o| o.success()).unwrap_or(false)
+    }
+
+    /// Simulate Ctrl+V paste on Linux.
+    pub fn send_ctrl_v() {
+        let is_wayland = std::env::var("WAYLAND_DISPLAY").is_ok();
+        if is_wayland {
+            // wtype doesn't support Ctrl+V; try ydotool or just skip
+            let _ = std::process::Command::new("ydotool")
+                .args(["key", "29:1", "47:1", "47:0", "29:0"])
+                .output();
+        } else {
+            // xdotool: Ctrl+V
+            let _ = std::process::Command::new("xdotool")
+                .args(["key", "--clearmodifiers", "ctrl+v"])
+                .output();
+        }
+    }
+}
+
+#[tauri::command]
+fn get_foreground_hwnd() -> u64 {
+    win32::get_foreground_hwnd()
+}
+
+#[tauri::command]
+fn set_foreground_hwnd(hwnd: u64) -> bool {
+    win32::set_foreground_hwnd(hwnd)
+}
+
+/// Type text into the focused input using Win32 clipboard + Ctrl+V.
+/// Pure Win32 API — no PowerShell needed for the critical path.
+///
+/// Flow: restore previous window focus → set clipboard via Win32 → send Ctrl+V via keybd_event
+#[tauri::command]
+fn type_text(text: String, restore_hwnd: Option<u64>) -> Result<bool, String> {
+    if text.trim().is_empty() {
+        return Ok(false);
+    }
+    let platform = std::env::consts::OS;
+    if platform == "windows" {
+        // Restore focus to the previously-focused window FIRST
+        if let Some(hwnd) = restore_hwnd {
+            win32::set_foreground_hwnd(hwnd);
+            std::thread::sleep(std::time::Duration::from_millis(50));
+        }
+        // Set clipboard via Win32 API (no PowerShell overhead)
+        if !win32::set_clipboard(&text) {
+            return Err("Failed to set clipboard".into());
+        }
+        // Small delay for clipboard to propagate
+        std::thread::sleep(std::time::Duration::from_millis(30));
+        // Send Ctrl+V via keybd_event (runs in Tauri's GUI thread — has active message loop)
+        win32::send_ctrl_v();
+        return Ok(true);
+    }
+    // Linux — clipboard approach (works regardless of which window has focus)
+    if platform == "linux" {
+        // Restore focus to the previously-captured window (X11 only — Wayland can't)
+        if let Some(hwnd) = restore_hwnd {
+            if hwnd != 0 {
+                win32::set_foreground_hwnd(hwnd);
+                std::thread::sleep(std::time::Duration::from_millis(50));
+            }
+        }
+        // Set clipboard — wtype/xdotool will type from clipboard
+        if !win32::set_clipboard(&text) {
+            return Err("Failed to set clipboard on Linux".into());
+        }
+        std::thread::sleep(std::time::Duration::from_millis(30));
+        // On X11: send Ctrl+V to paste. On Wayland: wtype to paste from clipboard.
+        let is_wayland = std::env::var("WAYLAND_DISPLAY").is_ok();
+        if is_wayland {
+            // wtype types directly into the focused Wayland window
+            let out = std::process::Command::new("wtype")
+                .arg(&text)
+                .output();
+            if let Ok(o) = out {
+                if o.status.success() {
+                    return Ok(true);
+                } else {
+                    return Err("wtype failed to type text on Wayland".into());
+                }
+            } else {
+                return Err("wtype command failed on Wayland".into());
+            }
+        }
+        // X11: Ctrl+V via xdotool
+        win32::send_ctrl_v();
+        return Ok(true);
+    }
+    if platform == "macos" {
+        let escaped = text.replace('\\', "\\\\").replace('"', "\\\"");
+        let script = format!("tell application \"System Events\" to keystroke \"{escaped}\"");
+        let out = std::process::Command::new("osascript")
+            .args(["-e", &script])
+            .output();
+        if let Ok(o) = out {
+            return Ok(o.status.success());
+        }
+    }
+    Err("No typing backend available".into())
 }
 
 #[tauri::command]
@@ -348,6 +1367,26 @@ pub fn run() {
             END;",
             kind: MigrationKind::Up,
         },
+        Migration {
+            version: 4,
+            description: "create dictionary entries table",
+            sql: "CREATE TABLE IF NOT EXISTS dictionary_entries (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                phrase TEXT NOT NULL UNIQUE,
+                replacement TEXT NOT NULL,
+                category TEXT DEFAULT 'custom',
+                notes TEXT DEFAULT '',
+                use_count INTEGER DEFAULT 0,
+                is_favorite INTEGER DEFAULT 0,
+                auto_learned INTEGER DEFAULT 0,
+                created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+                updated_at DATETIME DEFAULT CURRENT_TIMESTAMP
+            );
+            CREATE INDEX IF NOT EXISTS idx_dict_category ON dictionary_entries(category);
+            CREATE INDEX IF NOT EXISTS idx_dict_favorite ON dictionary_entries(is_favorite);
+            CREATE INDEX IF NOT EXISTS idx_dict_phrase ON dictionary_entries(phrase);",
+            kind: MigrationKind::Up,
+        },
     ];
 
     tauri::Builder::default()
@@ -362,6 +1401,7 @@ pub fn run() {
         .plugin(tauri_plugin_store::Builder::new().build())
         .plugin(tauri_plugin_clipboard_manager::init())
         .plugin(tauri_plugin_global_shortcut::Builder::new().build())
+        .plugin(tauri_plugin_updater::Builder::new().build())
         .invoke_handler(tauri::generate_handler![
             get_backend_path,
             get_platform_info,
@@ -369,6 +1409,18 @@ pub fn run() {
             check_model_status,
             delete_model_file,
             get_history,
+            get_insights,
+            get_voice_intelligence,
+            get_dictionary,
+            add_dictionary_entry,
+            update_dictionary_entry,
+            delete_dictionary_entry,
+            toggle_dictionary_favorite,
+            import_dictionary_csv,
+            export_dictionary_csv,
+            type_text,
+            get_foreground_hwnd,
+            set_foreground_hwnd,
             widget::show_widget,
             widget::hide_widget,
             widget::get_widget_visible,
@@ -445,6 +1497,23 @@ pub fn run() {
                         let _ = window_clone.hide();
                     }
                 });
+            }
+
+            // --- Wayland: re-show widget when it loses focus (alwaysOnTop not supported) ---
+            let is_wayland = std::env::var("WAYLAND_DISPLAY").is_ok();
+            if is_wayland {
+                if let Some(widget) = app.get_webview_window("widget") {
+                    let widget_clone = widget.clone();
+                    widget.on_window_event(move |event| {
+                        if let tauri::WindowEvent::Focused(focused) = event {
+                            if !focused {
+                                // Widget lost focus — re-show to keep it visible on Wayland
+                                // (compositors don't respect alwaysOnTop on Wayland)
+                                let _ = widget_clone.show();
+                            }
+                        }
+                    });
+                }
             }
 
             Ok(())
