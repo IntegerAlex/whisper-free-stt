@@ -1,4 +1,5 @@
 mod widget;
+mod commands;
 #[cfg(test)]
 mod tests;
 
@@ -1200,80 +1201,6 @@ fn set_foreground_hwnd(hwnd: u64) -> bool {
     win32::set_foreground_hwnd(hwnd)
 }
 
-/// Type text into the focused input using Win32 clipboard + Ctrl+V.
-/// Pure Win32 API — no PowerShell needed for the critical path.
-///
-/// Flow: restore previous window focus → set clipboard via Win32 → send Ctrl+V via keybd_event
-#[tauri::command]
-fn type_text(text: String, restore_hwnd: Option<u64>) -> Result<bool, String> {
-    if text.trim().is_empty() {
-        return Ok(false);
-    }
-    let platform = std::env::consts::OS;
-    if platform == "windows" {
-        // Restore focus to the previously-focused window FIRST
-        if let Some(hwnd) = restore_hwnd {
-            win32::set_foreground_hwnd(hwnd);
-            std::thread::sleep(std::time::Duration::from_millis(50));
-        }
-        // Try clipboard+Ctrl+V first (fast, preserves clipboard)
-        if win32::set_clipboard(&text) {
-            std::thread::sleep(std::time::Duration::from_millis(30));
-            win32::send_ctrl_v();
-            return Ok(true);
-        }
-        // Fallback: SendInput Unicode (works in apps that ignore Ctrl+V)
-        win32::send_text_unicode(&text);
-        return Ok(true);
-    }
-    // Linux — clipboard approach (works regardless of which window has focus)
-    if platform == "linux" {
-        // Restore focus to the previously-captured window (X11 only — Wayland can't)
-        if let Some(hwnd) = restore_hwnd {
-            if hwnd != 0 {
-                win32::set_foreground_hwnd(hwnd);
-                std::thread::sleep(std::time::Duration::from_millis(50));
-            }
-        }
-        // Set clipboard — wtype/xdotool will type from clipboard
-        if !win32::set_clipboard(&text) {
-            return Err("Failed to set clipboard on Linux".into());
-        }
-        std::thread::sleep(std::time::Duration::from_millis(30));
-        // On X11: send Ctrl+V to paste. On Wayland: wtype to paste from clipboard.
-        let is_wayland = std::env::var("WAYLAND_DISPLAY").is_ok();
-        if is_wayland {
-            // wtype types directly into the focused Wayland window
-            let out = std::process::Command::new("wtype")
-                .arg(&text)
-                .output();
-            if let Ok(o) = out {
-                if o.status.success() {
-                    return Ok(true);
-                } else {
-                    return Err("wtype failed to type text on Wayland".into());
-                }
-            } else {
-                return Err("wtype command failed on Wayland".into());
-            }
-        }
-        // X11: Ctrl+V via xdotool
-        win32::send_ctrl_v();
-        return Ok(true);
-    }
-    if platform == "macos" {
-        let escaped = text.replace('\\', "\\\\").replace('"', "\\\"");
-        let script = format!("tell application \"System Events\" to keystroke \"{escaped}\"");
-        let out = std::process::Command::new("osascript")
-            .args(["-e", &script])
-            .output();
-        if let Ok(o) = out {
-            return Ok(o.status.success());
-        }
-    }
-    Err("No typing backend available".into())
-}
-
 #[tauri::command]
 fn get_backend_path() -> Result<String, AppError> {
     let candidates = vec![
@@ -1487,9 +1414,13 @@ pub fn run() {
             toggle_dictionary_favorite,
             import_dictionary_csv,
             export_dictionary_csv,
-            type_text,
             get_foreground_hwnd,
             set_foreground_hwnd,
+            commands::begin_capture,
+            commands::end_capture,
+            commands::insert_text,
+            commands::show_overlay,
+            commands::hide_overlay,
             widget::show_widget,
             widget::hide_widget,
             widget::get_widget_visible,

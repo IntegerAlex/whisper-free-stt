@@ -8,7 +8,6 @@ import { Mic, PlugZap, ShieldCheck, Mic2, Sparkles, Settings2, Activity, Termina
 import OnboardingWizard from "./components/OnboardingWizard";
 import MicButton from "./components/MicButton";
 import MicPermissionModal from "./components/MicPermissionModal";
-import PttOverlay from "./components/PttOverlay";
 import ModelBadge from "./components/ModelBadge";
 import ErrorBanner from "./components/ErrorBanner";
 import type { AppError } from "./components/ErrorBanner";
@@ -61,6 +60,9 @@ interface TranscriptLine {
   status: string;
   createdAt: string;
 }
+
+/** Frontend-owned PTT state machine. The backend is a pure engine. */
+type PttState = "idle" | "listening" | "processing" | "inserting" | "success";
 
 export interface RuntimeSettings {
   wsPort: number;
@@ -784,7 +786,6 @@ function App() {
   const [showErrors, setShowErrors] = useState(false);
   const [showMicModal, setShowMicModal] = useState(false);
   const [highlightPermissions, setHighlightPermissions] = useState(false);
-  const [pttActive, setPttActive] = useState(false);
   const [resolvedModel, setResolvedModel] = useState<{ profile: string; model: string; backend: string; device: string } | null>(null);
   const pttHwndRef = useRef<number | null>(null);  // Target HWND captured on PTT press
   const pttTextRef = useRef<string>("");            // Latest transcription text for PTT commit
@@ -805,7 +806,6 @@ function App() {
   const sessionCounter = useRef(0);
   const feedRef = useRef<HTMLDivElement | null>(null);
   const connectedRef = useRef(connected);
-  const isStartingRef = useRef(false);
   const isCommittingRef = useRef(false);
   const startRef = useRef<(overrideSettings?: RuntimeSettings, source?: string) => void>(() => {});
   const stopRef = useRef<(source?: string, commit?: boolean) => void>(() => {});
@@ -967,9 +967,11 @@ function App() {
         (target as HTMLInputElement).isContentEditable === true;
       if (e.code === "Space" && tag !== "INPUT" && tag !== "SELECT" && tag !== "TEXTAREA" && !isInteractive) {
         e.preventDefault();
-        if (connectedRef.current || isCommittingRef.current) {
+        if (pttStateRef.current === "listening") {
           stopRef.current("SpaceBar");
-        } else startRef.current(undefined, "SpaceBar");
+        } else if (pttStateRef.current === "idle") {
+          startRef.current(undefined, "SpaceBar");
+        }
       }
     };
     window.addEventListener("keydown", handler);
@@ -1038,17 +1040,8 @@ function App() {
         ...prev,
         { id, raw: event.text, processed: "", status: "transcribing", createdAt: new Date().toISOString() },
       ].slice(-500));
-      // Real-time: commit ASR text to focused window during recording
+      // Store the latest text for PTT commit
       pttTextRef.current = event.text;
-      if (connectedRef.current && pttHwndRef.current && event.text.trim()) {
-        const hwnd = pttHwndRef.current;
-        const text = event.text;
-        import("@tauri-apps/api/core").then(({ invoke }) => {
-          invoke<boolean>("type_text", { text, restoreHwnd: hwnd }).then((ok) => {
-            console.log(`[PTT] Real-time commit (raw):`, ok);
-          }).catch(() => {});
-        }).catch(() => {});
-      }
       return;
     }
     if (event.type === "processed") {
@@ -1058,16 +1051,6 @@ function App() {
         line.id === id ? { ...line, processed: event.text, status: "done" } : line
       ));
       pttTextRef.current = event.text;
-      // Real-time: commit LLM-rewritten text to focused window
-      if (connectedRef.current && pttHwndRef.current && event.text.trim()) {
-        const hwnd = pttHwndRef.current;
-        const text = event.text;
-        import("@tauri-apps/api/core").then(({ invoke }) => {
-          invoke<boolean>("type_text", { text, restoreHwnd: hwnd }).then((ok) => {
-            console.log(`[PTT] Real-time commit (processed):`, ok);
-          }).catch(() => {});
-        }).catch(() => {});
-      }
     }
     if (event.type === "llm_partial") {
       const id = event.utterance_id;
@@ -1083,83 +1066,150 @@ function App() {
     setErrors((prev) => prev.map((e) => (e.category === category ? { ...e, dismissed: true } : e)));
   };
 
+  // --- PTT state machine — frontend owns every decision ---
+  const [_pttState, setPttState] = useState<PttState>("idle");
+  const pttStateRef = useRef<PttState>("idle");
+
+  const setPtt = (next: PttState) => {
+    pttStateRef.current = next;
+    setPttState(next);
+  };
+
   // --- PTT lifecycle: send commands to running backend ---
   const start = async (_overrideSettings?: RuntimeSettings, source: string = "Unknown") => {
-    if (connected || isStartingRef.current || isCommittingRef.current) {
-      console.log(`[PTT] Start rejected — busy, source=${source}`);
+    if (pttStateRef.current !== "idle") {
+      console.log(`[PTT] Start rejected — state=${pttStateRef.current}, source=${source}`);
       return;
     }
-    isStartingRef.current = true;
     if (!runtimeRef.current) {
       console.log(`[PTT] Start rejected — engine not ready, source=${source}`);
-      isStartingRef.current = false;
       setToast("Engine not ready — wait a moment and try again");
       return;
     }
-    // Capture the foreground window BEFORE recording steals focus
+
+    // Idle → Listening
+    setPtt("listening");
+    console.log(`[PTT] Start — source=${source}`);
+
+    // Tell overlay to show in listening mode
+    try {
+      const { emit } = await import("@tauri-apps/api/event");
+      await emit("overlay:command", "listening" as const);
+    } catch { /* not in Tauri */ }
+
+    // Capture foreground window
     try {
       const { invoke } = await import("@tauri-apps/api/core");
       const hwnd = await invoke<number>("get_foreground_hwnd");
       pttHwndRef.current = hwnd;
-      console.log(`[PTT] Captured HWND: ${hwnd} (source=${source})`);
     } catch {
       pttHwndRef.current = null;
     }
+
     pttTextRef.current = "";
     sessionCounter.current++;
     nextLocalId.current = 1;
     setLines([]);
-    console.log(`[PTT] Start requested — source=${source}, session=${sessionCounter.current}`);
     playStartBeep();
-    runtimeRef.current.start(); // Sends start_recording to backend
+
+    // Show overlay (positioned above taskbar)
+    try {
+      const { invoke } = await import("@tauri-apps/api/core");
+      await invoke("show_overlay");
+    } catch { /* not in Tauri */ }
+
+    // Tell backend to begin capturing
+    runtimeRef.current.start();
     setConnected(true);
-    setPttActive(true);
     dismissErrorsOfCategory("connection");
   };
 
-  /** Atomic stop + wait-for-idle + type + cleanup. All callers use this. */
+  /** Listening → Processing → (wait) → Inserting → Success → Idle */
   const stopAndCommit = async (source: string = "Unknown", commit = true) => {
+    if (pttStateRef.current !== "listening") return;
     if (!runtimeRef.current) return;
-    if (!connectedRef.current && !isStartingRef.current) return;
-    isStartingRef.current = false;
-    isCommittingRef.current = true;
-    console.log(`[PTT] Stop requested — source=${source}`);
+
+    // Listening → Processing
+    setPtt("processing");
+    console.log(`[PTT] Stop — source=${source}`);
     playStopBeep();
-    runtimeRef.current.stop(); // Sends stop_recording to backend
+
+    // Tell overlay to show processing state
+    try {
+      const { emit } = await import("@tauri-apps/api/event");
+      await emit("overlay:command", "processing" as const);
+    } catch { /* not in Tauri */ }
+
+    // Tell backend to stop capturing
+    runtimeRef.current.stop();
     setConnected(false);
-    setPttActive(false);
     micLevelEmitter.emit(0);
 
-    if (commit) {
-      // Wait for backend to finish transcriptions (state → idle) with timeout
-      await new Promise<void>((resolve) => {
-        pttIdleResolveRef.current = resolve;
-        setTimeout(() => { resolve(); }, 10000);
-      });
-      pttIdleResolveRef.current = null;
-
-      // Read accumulated text and type it
-      const text = pttTextRef.current.trim();
-      const hwnd = pttHwndRef.current;
-      if (text && hwnd) {
-        try {
-          const { invoke } = await import("@tauri-apps/api/core");
-          const ok = await invoke<boolean>("type_text", { text, restoreHwnd: hwnd });
-          console.log(`[PTT] Committed text to HWND ${hwnd} (source=${source}):`, ok);
-          if (!ok) setToast("Failed to commit text");
-        } catch (e) {
-          console.error("[PTT] type_text failed:", e);
-          setToast("Failed to commit text");
-        }
-      } else {
-        console.log(`[PTT] Nothing to commit (source=${source}, text:`, !!text, "hwnd:", !!hwnd, ")");
-      }
+    if (!commit) {
+      // No commit — go straight to Idle
+      setPtt("idle");
+      setStatus("idle");
+      try {
+        const { invoke } = await import("@tauri-apps/api/core");
+        await invoke("hide_overlay");
+      } catch { /* not in Tauri */ }
+      return;
     }
+
+    // Wait for backend to finish all transcriptions (state → idle)
+    await new Promise<void>((resolve) => {
+      pttIdleResolveRef.current = resolve;
+      setTimeout(() => { resolve(); }, 10000);
+    });
+    pttIdleResolveRef.current = null;
+
+    // Read accumulated text
+    const text = pttTextRef.current.trim();
+    const hwnd = pttHwndRef.current;
+
+    if (text && hwnd) {
+      // Processing → Inserting
+      setPtt("inserting");
+      // Tell overlay to show inserting state
+      try {
+        const { emit } = await import("@tauri-apps/api/event");
+        await emit("overlay:command", "inserting" as const);
+      } catch { /* not in Tauri */ }
+      try {
+        const { invoke } = await import("@tauri-apps/api/core");
+        const ok = await invoke<boolean>("insert_text", { text, restoreHwnd: hwnd });
+        console.log(`[PTT] Inserted text to HWND ${hwnd} (source=${source}):`, ok);
+        if (!ok) setToast("Failed to insert text");
+      } catch (e) {
+        console.error("[PTT] insert_text failed:", e);
+        setToast("Failed to insert text");
+      }
+    } else {
+      console.log(`[PTT] Nothing to commit (source=${source})`);
+    }
+
+    // Inserting → Success (brief confirmation)
+    setPtt("success");
+    setStatus("idle");
+
+    // Tell overlay to show success state
+    try {
+      const { emit } = await import("@tauri-apps/api/event");
+      await emit("overlay:command", "success" as const);
+    } catch { /* not in Tauri */ }
+
+    // Success → Idle after 400ms
+    setTimeout(() => {
+      setPtt("idle");
+      // Hide overlay
+      import("@tauri-apps/api/core").then(({ invoke }) => {
+        invoke("hide_overlay");
+      }).catch(() => {});
+    }, 400);
 
     // Clean up
     pttTextRef.current = "";
     pttHwndRef.current = null;
-    setStatus("idle");
     isCommittingRef.current = false;
   };
 
@@ -1184,9 +1234,11 @@ function App() {
       try {
         const { listen } = await import("@tauri-apps/api/event");
         unlistenToggle = await listen("widget-toggle", () => {
-          if (connectedRef.current || isCommittingRef.current) {
+          if (pttStateRef.current === "listening") {
             stopRef.current("Widget");
-          } else startRef.current(undefined, "Widget");
+          } else if (pttStateRef.current === "idle") {
+            startRef.current(undefined, "Widget");
+          }
         });
         unlistenShowMain = await listen("widget-show-main", async () => {
           try {
@@ -1209,9 +1261,9 @@ function App() {
       try {
         const { listen } = await import("@tauri-apps/api/event");
         unlisten = await listen<string>("tray-action", (event) => {
-          if (event.payload === "start" && !connectedRef.current && !isCommittingRef.current) {
+          if (event.payload === "start" && pttStateRef.current === "idle") {
             startRef.current(undefined, "Tray");
-          } else if (event.payload === "stop" && (connectedRef.current || isCommittingRef.current)) {
+          } else if (event.payload === "stop" && pttStateRef.current === "listening") {
             stopRef.current("Tray");
           }
         });
@@ -1226,16 +1278,16 @@ function App() {
         const savedHotkey = localStorage.getItem("stt-hotkey") || "CommandOrControl+Shift+Space";
         await register(savedHotkey, (event) => {
           if (event.state === "Pressed") {
-            if (connectedRef.current) {
-              console.log("[PTT] Ignored — already recording");
+            if (pttStateRef.current !== "idle") {
+              console.log("[PTT] Ignored — not idle");
               return;
             }
             console.log("[PTT] Hotkey pressed — starting recording");
             startRef.current(settings, "Hotkey");
           } else if (event.state === "Released") {
             console.log("[PTT] Hotkey released — committing text");
-            if (!connectedRef.current && !isCommittingRef.current) {
-              console.log("[PTT] Not recording — nothing to commit");
+            if (pttStateRef.current !== "listening") {
+              console.log("[PTT] Not listening — nothing to commit");
               return;
             }
             stopRef.current("Hotkey");
@@ -1383,7 +1435,7 @@ function App() {
         onSave={async (s) => {
           setSettings(s);
           setSettingsVersion((v) => v + 1); // Trigger engine respawn with new CLI args
-          if (connectedRef.current) {
+          if (pttStateRef.current === "listening") {
             stopRef.current("SettingsSave", false);
           }
         }}
@@ -1403,7 +1455,6 @@ function App() {
         }}
         onClose={() => setShowMicModal(false)}
       />
-      <PttOverlay visible={pttActive} />
     </AppStateContext.Provider>
   );
 }

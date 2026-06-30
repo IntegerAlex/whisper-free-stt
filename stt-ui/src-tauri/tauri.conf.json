@@ -35,6 +35,21 @@
         "visible": false,
         "transparent": true,
         "shadow": false
+      },
+      {
+        "label": "overlay",
+        "title": "",
+        "url": "/index.html?window=overlay",
+        "width": 280,
+        "height": 60,
+        "decorations": false,
+        "resizable": false,
+        "alwaysOnTop": true,
+        "skipTaskbar": true,
+        "visible": false,
+        "transparent": true,
+        "shadow": false,
+        "focusable": false
       }
     ],
     "security": {
