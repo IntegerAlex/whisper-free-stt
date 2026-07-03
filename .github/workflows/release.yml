@@ -15,8 +15,38 @@ permissions:
   contents: write
 
 jobs:
+  resolve-release:
+    name: Resolve Release
+    runs-on: ubuntu-latest
+    outputs:
+      release_id: ${{ steps.resolve.outputs.release_id }}
+      tag: ${{ steps.resolve.outputs.tag }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.inputs.tag || '' }}
+          fetch-depth: 0
+      - name: Resolve release ID
+        id: resolve
+        shell: bash
+        run: |
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            TAG="${{ github.event.inputs.tag }}"
+          else
+            TAG="${GITHUB_REF#refs/tags/}"
+          fi
+          echo "tag=$TAG" >> "$GITHUB_OUTPUT"
+          RELEASE_ID=$(gh api repos/${{ github.repository }}/releases/tags/$TAG --jq '.id' 2>/dev/null || true)
+          if [ -z "$RELEASE_ID" ]; then
+            RELEASE_ID=$(gh api repos/${{ github.repository }}/releases -f tag_name="$TAG" -f name="$TAG" --jq '.id')
+          fi
+          echo "release_id=$RELEASE_ID" >> "$GITHUB_OUTPUT"
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
   release:
     name: Build & Release
+    needs: resolve-release
     strategy:
       fail-fast: false
       matrix:
@@ -75,31 +105,14 @@ jobs:
         run: |
           curl -sL https://github.com/AppImage/AppImageKit/releases/download/continuous/appimagetool-x86_64.AppImage -o /tmp/appimagetool
           chmod +x /tmp/appimagetool
-          /tmp/appimagetool --version
+          # Extract instead of running (FUSE not available on CI)
+          /tmp/appimagetool --appimage-extract > /dev/null 2>&1 || true
           sudo cp /tmp/appimagetool /usr/local/bin/appimagetool
 
       - name: Build sidecar
         working-directory: stt-ui
         run: bash scripts/build-sidecar.sh
         if: matrix.platform == 'ubuntu-22.04'
-
-      - name: Resolve release ID
-        id: resolve-release
-        run: |
-          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
-            TAG="${{ github.event.inputs.tag }}"
-          else
-            TAG="${GITHUB_REF#refs/tags/}"
-          fi
-          echo "tag=$TAG" >> "$GITHUB_OUTPUT"
-          # Create or get existing release
-          RELEASE_ID=$(gh api repos/${{ github.repository }}/releases/tags/$TAG --jq '.id' 2>/dev/null || true)
-          if [ -z "$RELEASE_ID" ]; then
-            RELEASE_ID=$(gh api repos/${{ github.repository }}/releases -f tag_name="$TAG" -f name="$TAG" --jq '.id')
-          fi
-          echo "release_id=$RELEASE_ID" >> "$GITHUB_OUTPUT"
-        env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
       - name: Build Tauri app
         uses: tauri-apps/tauri-action@v0
@@ -109,7 +122,7 @@ jobs:
           TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
         with:
           projectPath: stt-ui
-          releaseId: ${{ steps.resolve-release.outputs.release_id }}
+          releaseId: ${{ needs.resolve-release.outputs.release_id }}
 
       - name: Upload artifacts
         uses: actions/upload-artifact@v4
@@ -122,18 +135,3 @@ jobs:
             stt-ui/src-tauri/target/release/bundle/**/*.deb
             stt-ui/src-tauri/target/release/bundle/**/*.rpm
           if-no-files-found: warn
-
-  create-release:
-    name: Create GitHub Release
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-        with:
-          ref: ${{ github.event.inputs.tag || '' }}
-      - name: Create Release
-        uses: softprops/action-gh-release@v2
-        with:
-          tag_name: ${{ github.event.inputs.tag || '' }}
-          generate_release_notes: true
-          draft: false
-          prerelease: ${{ contains(github.ref, '-') }}
