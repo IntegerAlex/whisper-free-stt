@@ -3,7 +3,7 @@
  * Tests every React component for rendering, interactions, accessibility, and edge cases.
  */
 import { describe, it, expect, vi, beforeEach, afterEach } from "vitest";
-import { render, screen, fireEvent, waitFor, within } from "@testing-library/react";
+import { render, screen, fireEvent, waitFor } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import React from "react";
 
@@ -14,9 +14,8 @@ Object.defineProperty(window, "__TAURI_INTERNALS__", { value: undefined, writabl
 
 // Mock framer-motion to avoid animation issues in tests
 vi.mock("framer-motion", () => {
-  const React = require("react");
   const createMotionComponent = (tag: string) =>
-    React.forwardRef<any, any>((props, ref) => React.createElement(tag, { ...props, ref }));
+    React.forwardRef<HTMLElement, Record<string, unknown>>((props, ref) => React.createElement(tag, { ...props, ref }));
 
   const motionProxy = new Proxy(
     {},
@@ -221,6 +220,7 @@ import OnboardingWizard from "@/components/OnboardingWizard";
 import WidgetView from "@/components/WidgetView";
 import { onboardingReducer, DEFAULT_ONBOARDING, MODEL_CATALOG } from "@/store";
 import type { STTEvent } from "@/api";
+import type { RuntimeSettings } from "../App";
 import { createWsApi } from "@/api-ws";
 
 // ── Helpers ──
@@ -732,7 +732,7 @@ describe("Sidebar", () => {
 // 13. SettingsPanel
 // ══════════════════════════════════════════════════════════════════
 describe("SettingsPanel", () => {
-  const defaultSettings = {
+  const defaultSettings: RuntimeSettings = {
     wsPort: 8765,
     asrProfile: "distil",
     backend: "auto",
@@ -905,7 +905,7 @@ describe("TabSwitcher", () => {
 // 16. ConfigSection
 // ══════════════════════════════════════════════════════════════════
 describe("ConfigSection", () => {
-  const MockIcon = () => <svg data-testid="mock-icon" />;
+  const MockIcon = (() => <svg data-testid="mock-icon" />) as unknown as import("lucide-react").LucideIcon;
 
   it("renders without crashing", () => {
     renderWithProviders(
@@ -1072,7 +1072,7 @@ describe("SnippetsPage", () => {
 describe("DictionaryPage", () => {
   beforeEach(() => {
     // Mock fetch for dictionary API calls
-    global.fetch = vi.fn(() =>
+    globalThis.fetch = vi.fn(() =>
       Promise.resolve({
         ok: true,
         json: () => Promise.resolve([]),
@@ -1132,7 +1132,7 @@ describe("ModelsPage", () => {
 // ══════════════════════════════════════════════════════════════════
 describe("InsightsPage", () => {
   beforeEach(() => {
-    global.fetch = vi.fn(() =>
+    globalThis.fetch = vi.fn(() =>
       Promise.resolve({
         ok: true,
         json: () => Promise.resolve({
@@ -1178,7 +1178,7 @@ describe("InsightsPage", () => {
 // ══════════════════════════════════════════════════════════════════
 describe("HistoryPage", () => {
   beforeEach(() => {
-    global.fetch = vi.fn(() =>
+    globalThis.fetch = vi.fn(() =>
       Promise.resolve({
         ok: true,
         json: () => Promise.resolve([]),
@@ -1548,7 +1548,7 @@ describe("Edge cases: empty/null props", () => {
   });
 
   it("ConfigSection without subtitle", () => {
-    const MockIcon = () => <svg />;
+    const MockIcon = (() => <svg />) as unknown as import("lucide-react").LucideIcon;
     renderWithProviders(
       <ConfigSection icon={MockIcon} title="Test">
         <div>child</div>

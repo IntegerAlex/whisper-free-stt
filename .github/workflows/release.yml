@@ -4,6 +4,12 @@ on:
   push:
     tags:
       - "v*"
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Version tag (e.g. v0.2.0)"
+        required: true
+        type: string
 
 permissions:
   contents: write
@@ -61,6 +67,12 @@ jobs:
         uses: astral-sh/setup-uv@v4
         with:
           version: "0.5"
+
+      - name: Install appimagetool (Linux)
+        if: matrix.platform == 'ubuntu-22.04'
+        run: |
+          curl -sL https://github.com/AppImage/AppImageKit/releases/download/continuous/appimagetool-x86_64.AppImage -o /usr/local/bin/appimagetool
+          chmod +x /usr/local/bin/appimagetool
 
       - name: Build sidecar
         working-directory: stt-ui

@@ -41,12 +41,20 @@ export function createTauriApi(args: string[], sidecarName: string = "binaries/s
   let listeners: Array<(e: STTEvent) => void> = [];
   let child: Child | null = null;
 
+  // Line buffers: accumulate partial data until newline boundary
+  let stdoutBuf = "";
+  let stderrBuf = "";
+
   const notifyError = (msg: string) => {
     for (const cb of listeners) cb({ type: "error", message: msg });
   };
 
-  const handleLine = (source: string, data: string) => {
-    const lines = data.split("\n");
+  const emitLines = (source: string, buf: string): string => {
+    const nlIdx = buf.lastIndexOf("\n");
+    if (nlIdx < 0) return buf;
+    const complete = buf.slice(0, nlIdx + 1);
+    const remainder = buf.slice(nlIdx + 1);
+    const lines = complete.split("\n");
     for (const raw of lines) {
       const trimmed = raw.trim();
       if (!trimmed) continue;
@@ -61,6 +69,7 @@ export function createTauriApi(args: string[], sidecarName: string = "binaries/s
         }
       }
     }
+    return remainder;
   };
 
   return {
@@ -69,9 +78,20 @@ export function createTauriApi(args: string[], sidecarName: string = "binaries/s
     async spawn() {
       const { Command } = await import("@tauri-apps/plugin-shell");
       const cmd = Command.sidecar(sidecarName, args);
-      cmd.stdout.on("data", (line: string) => handleLine("stdout", line));
-      cmd.stderr.on("data", (line: string) => handleLine("stderr", line));
+      cmd.stdout.on("data", (chunk: string) => {
+        stdoutBuf += chunk;
+        stdoutBuf = emitLines("stdout", stdoutBuf);
+      });
+      cmd.stderr.on("data", (chunk: string) => {
+        stderrBuf += chunk;
+        stderrBuf = emitLines("stderr", stderrBuf);
+      });
       cmd.on("close", () => {
+        // Flush any remaining buffered data
+        if (stdoutBuf.trim()) emitLines("stdout", stdoutBuf + "\n");
+        if (stderrBuf.trim()) emitLines("stderr", stderrBuf + "\n");
+        stdoutBuf = "";
+        stderrBuf = "";
         for (const cb of listeners) cb({ type: "state", state: "idle" });
       });
       cmd.on("error", (err: string) => {
