@@ -64,40 +64,71 @@ This sets `detector._noise_floor = max(0.003, 1e-6) = 0.003`.
 
 ### Step 4: Compute initial thresholds
 
-The detector computes adaptive thresholds from the noise floor:
+The detector computes adaptive thresholds from the noise floor using SNR-based
+formulas (not fixed RMS thresholds):
 
 ```python
-end_threshold   = clamp(noise_floor × noise_floor_margin,  0.005, 0.1)
-                = clamp(0.003 × 3.0, 0.005, 0.1)
-                = clamp(0.009, 0.005, 0.1)
-                = 0.009
+# End threshold: noise floor × SNR ratio
+end_threshold = noise_floor × 10^(speech_threshold_db / 20)
+             = 0.003 × 10^(6.0 / 20)
+             = 0.003 × 1.995
+             = 0.006
 
-start_threshold = clamp(end_threshold × start_threshold_multiplier, end_th, 0.2)
-                = clamp(0.009 × 1.3, 0.009, 0.2)
-                = clamp(0.0117, 0.009, 0.2)
-                = 0.0117
+# Start threshold: end threshold + hysteresis margin
+start_threshold = noise_floor × 10^((speech_threshold_db + hysteresis_up_db) / 20)
+               = 0.003 × 10^(10.0 / 20)
+               = 0.003 × 3.162
+               = 0.0095
 ```
 
 So after calibration with a quiet room (p10=0.003):
-- Speech must exceed **RMS 0.012** to trigger detection
-- Speech drops below **RMS 0.009** to end the utterance
-- The **hysteresis gap** is 0.0027 (start − end)
+- Speech must exceed **RMS 0.0095** to trigger detection
+- Speech drops below **RMS 0.006** to end the utterance
+- The **hysteresis gap** is 0.0035 (start − end)
+
+### Step 5: Spectral baselines (optional)
+
+When `use_spectral_vad=True`, calibration also computes baselines for spectral
+features (centroid, flux, ZCR, BER) from the ambient noise. These baselines
+are used to normalize spectral features during runtime scoring.
 
 ## Ongoing Adaptation
 
-After calibration, the noise floor continues to track via exponential moving
-average (EMA) during non-speech periods:
+After calibration, the noise floor continues to track via **dual-timescale EMA**
+during non-speech periods:
 
+### Slow EMA (30-minute baseline)
 ```python
-if not _in_speech and rms <= start_threshold:
-    noise_floor = 0.95 × noise_floor + 0.05 × rms
+noise_slow = 0.9999 * noise_slow + 0.0001 * min_energy
 ```
 
-With α = 0.95, the noise floor has a **half-life of ~14 blocks** (~0.9 seconds).
-This means:
-- Brief noise spikes (door closing) barely register
-- Sustained changes (fan turns on, room gets noisier) adapt within a few seconds
-- The floor never drops below `silence_threshold_rms / noise_floor_margin` (the initial floor from the constructor)
+### Fast EMA (2-second rapid changes)
+```python
+noise_fast = 0.995 * noise_fast + 0.005 * min_energy
+```
+
+### Adaptive Blending
+```python
+# 10th percentile of 3-second energy history (robust to speech)
+min_energy = percentile(energy_history, 10)
+
+# Fast window detects rapid noise changes
+if len(energy_history) >= 50:
+    fast_min = percentile(last_50, 10)
+    if abs(fast_min - noise_floor) > 0.02:
+        # Rapid change: blend 50/50, faster alpha
+        noise_floor = 0.5 * noise_floor + 0.5 * fast_min
+        alpha = 0.99
+    else:
+        # Decay back to slow adaptation
+        alpha = min(0.9999, alpha + 0.001)
+
+noise_floor = alpha * noise_floor + (1 - alpha) * min_energy
+noise_floor = clip(noise_floor, 0.001, 0.5)
+```
+
+The noise floor is also continuously updated by `update_imcra_noise()` which
+tracks local minima of the power spectrum (simplified IMCRA).
 
 ## Why This Works
 
@@ -105,25 +136,28 @@ This means:
 |---|---|
 | Different mics have different gains | Calibration measures the actual noise level of the selected mic |
 | User speaks during calibration | 10th percentile ignores transient speech spikes |
-| Room noise changes over time | EMA continues tracking after calibration |
-| Silent room → threshold too low → false triggers | `max(..., silence_threshold_rms)` floor at 0.005 |
-| Noisy room → threshold too high → miss speech | Caps at 0.1 (end) and 0.2 (start) prevent unusable thresholds |
+| Room noise changes over time | Dual-timescale EMA continues tracking after calibration |
+| Silent room → threshold too low → false triggers | `max(..., 0.001)` floor prevents degenerate thresholds |
+| Noisy room → threshold too high → miss speech | Caps at 0.5 prevent unusable thresholds |
 | First utterance cold start | ASR model loaded in parallel thread during calibration |
+| Non-stationary noise (fan on/off) | Fast EMA (2s) detects changes, slow EMA (30min) provides baseline |
 
 ## Edge Cases
 
 ### Dead-silent room (p10 ≈ 0.0)
 ```
 p10 = 0.001
-end_th = clamp(0.001 × 3.0, 0.005, 0.1) = 0.005   ← floor kicks in
-start_th = clamp(0.005 × 1.3, 0.005, 0.2) = 0.0065
+noise_floor = 0.001
+end_th = 0.001 × 10^(6/20) = 0.002
+start_th = 0.001 × 10^(10/20) = 0.003
 ```
 
 ### Noisy room (p10 = 0.05)
 ```
 p10 = 0.05
-end_th = clamp(0.05 × 3.0, 0.005, 0.1) = 0.1      ← cap kicks in
-start_th = clamp(0.1 × 1.3, 0.1, 0.2) = 0.13
+noise_floor = 0.05
+end_th = 0.05 × 10^(6/20) = 0.10
+start_th = 0.05 × 10^(10/20) = 0.16
 ```
 
 ### All mics silent (calibration fails)
@@ -140,3 +174,16 @@ The ASR model warm-up (`warm_up_backend`) is launched as a daemon thread before
 calibration begins. It runs completely in parallel — the mic stream and calibration
 are on the main thread, while model loading happens on the warm-up thread. By the
 time the first utterance is transcribed, the model is already in memory.
+
+## Comparison with Full IMCRA
+
+The calibration uses a simplified noise estimation. The full `StreamingEndpointDetector`
+uses:
+
+| Feature | Calibration | Runtime |
+|---|---|---|
+| Noise estimate | 10th percentile | Dual-timescale EMA + simplified IMCRA |
+| Thresholds | Fixed SNR-based | SNR-based with adaptive margins |
+| Spectral features | Baseline collection | Multi-feature fusion (flux, centroid, ZCR, BER) |
+| Hangover | None | 150ms prevents truncation |
+| State machine | None | SILENCE → SPEECH with hysteresis |

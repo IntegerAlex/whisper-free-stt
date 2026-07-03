@@ -31,7 +31,9 @@ Special tokens: `<|startoftranscript|>`, language code, `<|transcribe|>`/`<|tran
 | small | 244M | 12 | 12 | 768 | 12 |
 | medium | 769M | 24 | 24 | 1024 | 16 |
 | large-v3 | 1.55B | 32 | 32 | 1280 | 20 |
-| large-v3-turbo | 809M | 32 | 32 | 1280 | 20 |
+| large-v3-turbo | 809M | 32 | 4 | 1280 | 20 |
+
+**Note:** large-v3-turbo is a pruned version — decoder reduced from 32→4 layers for ~5x speedup with minor quality loss. Released Oct 2024.
 
 ### Noise Robustness
 Training on 680K hours of noisy web data makes Whisper inherently noise-robust. No explicit noise adaptation needed.
@@ -250,6 +252,40 @@ Human conversation threshold: **200-300ms** total pipeline
 ├── TTS: 100-300ms (streaming)
 └── Network: ~20-50ms
 ```
+
+---
+
+## 9. Latest ASR Developments (2025-2026)
+
+### Whisper Large-v3-Turbo (Oct 2024)
+Pruned version of large-v3: decoder layers reduced from 32→4. Same encoder (32 layers).
+~5x faster inference, minor quality degradation. Parameters: 809M, d_model=1280.
+
+### whisper.cpp 1.8.3 (Jan 2026)
+12x performance boost on integrated AMD/Intel GPUs via Vulkan API.
+Also supports OpenVINO for Intel Arc GPUs. Key benchmark:
+- AMD Ryzen 7 6800H + Radeon 680M: 0.3 RTF (CPU) → 3.4 RTF (iGPU)
+- Intel Core Ultra 7 155H + Arc Graphics: similar gains
+
+### faster-whisper 1.1.0 (Nov 2025)
+- New batched inference 4x faster than v1.0
+- VAD filter 3x faster on CPU
+- Feature extraction 3x faster
+- `large-v3-turbo` support
+- `multilingual` option for transcribing multilingual audio
+
+### NVIDIA Nemotron Speech ASR (Jan 2026)
+Cache-aware streaming with FastConformer (8x downsampling). Processes only new audio
+"deltas" — 3x higher efficiency than buffered inference. 0.6B parameters.
+Key insight: VAD at frontend segmenting audio into chunks for incremental encoding.
+
+### Speech ReaLLM (Microsoft, 2024)
+First "decoder-only" ASR architecture for continuous audio without explicit end-pointing.
+Marries decoder-only LLM with RNN-T. 80M model achieves 3.0% WER on LibriSpeech.
+
+### ByteDance Seed-ASR (2025)
+Trained on 20M+ hours of speech, LLM-based architecture. 10-40% error rate reduction
+relative to Whisper. Powers CapCut/Douyin/Feishu ASR backends.
 
 ---
 

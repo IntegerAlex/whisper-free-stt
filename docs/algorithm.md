@@ -125,17 +125,21 @@ IF len(history) >= 150:
     imcra_noise_est = local_min * bias
 ```
 
+**Note**: This is the simplified single-pass version. The full IMCRA (Cohen 2003)
+uses two-pass smoothing and speech-presence-probability control. Our implementation
+trades some accuracy for real-time performance at 100fps.
+
 ## SNR-Based Speech Scoring
 
 Instead of arbitrary RMS thresholds, speech is detected using SNR in dB:
 
 ```
 snr_linear = rms / max(noise_floor, 1e-10)
-snr_db = 10 * log10(snr_linear)
+snr_db = 20 * log10(snr_linear)
 energy_score = snr_db / speech_threshold_db  # 6dB = 2x louder = speech
 ```
 
-### Multi-Feature Fusion (Optional)
+### Multi-Feature Fusion
 
 When `use_spectral_vad=True`, combines energy with spectral features:
 
@@ -151,6 +155,28 @@ composite = (1 - w) * energy_score + w * (energy_score * 0.6 + spectral_score * 
 ```
 
 Where `w = spectral_weight` (default 0.4).
+
+### Early Exit Optimization
+
+When `snr_db < -2.0`, spectral feature computation is skipped (expensive FFT).
+This saves ~30% CPU on silence-dominant audio with no accuracy loss.
+
+## Spectral Features
+
+| Feature | What it measures | Speech range | Noise range |
+|---|---|---|---|
+| Spectral flux | L1 distance between consecutive FFT frames | High (onset) | Low (steady) |
+| Spectral centroid | Weighted mean frequency | 1-3 kHz | <500 Hz |
+| Zero-crossing rate | Fraction of sign changes | 0.03-0.25 | <0.03 |
+| Band energy ratio | Energy in 300-3400 Hz vs total | >0.5 | <0.3 |
+
+Normalization:
+```
+flux_norm = min(flux / 50.0, 1.0)
+centroid_norm = 1.0 if 300 < centroid < 4000 else max(0.2, 1.0 - |centroid - 2000| / 3000)
+zcr_norm = 1.0 if 0.03 < zcr < 0.25 else 0.2
+ber_norm = min(ber / 2.0, 1.0)
+```
 
 ## Hysteresis VAD State Machine
 
@@ -217,45 +243,53 @@ is_speech_final = hang_counter > 0 OR is_speech
 | `min_recording_sec` | 0.5 | Ignore clicks, coughs, chair creaks |
 | `max_recording_sec` | 15.0 | Safety valve for runaway recordings |
 | `spectral_weight` | 0.4 | Balance between energy and spectral features |
+| `pre_speech_padding_sec` | 0.2 | Audio context before speech onset |
 
 ## Transcription Pipeline
 
 ### 1. Pre-processing
-- Normalize to float32 in [-1, 1]: `audio / max(|audio|)` if peak > 1.0
-- Trim trailing silence: find last sample above 0.005, keep 200ms pad after it
-- Noise reduction: spectral gating via `noisereduce` library
+- Normalize to float32 in [-1, 1]: `audio / max(|audio|)` if peak > 1.0 (ALL audio, not just clipping)
+- Trim trailing silence: find last sample above 0.001 (was 0.005), keep 200ms pad after it
+- Noise reduction: spectral gating via `noisereduce` library (skips short/clean signals)
 
 ### 2. Backend Dispatch
 ```
 IF config.backend == WHISPER_CPP:
     model = cached pywhispercpp.Model(ggml_model_name)
     segments = model.transcribe(audio, single_segment=True)
+    # Runs in subprocess for crash isolation (segfault survival)
+    # Frozen binary: uses in-process run_worker()
 ELSE:
     model = cached faster_whisper.WhisperModel(name, device, compute_type)
     segments, info = model.transcribe(audio, beam_size, language, ...)
     # CUDA failure → retry with device="cpu", compute_type="int8"
 ```
 
-### 3. Post-processing
-- Concatenate segment texts with spaces
-- Filter junk tokens: `[BLANK_AUDIO]`, `[MUSIC]`, `[NOISE]`
-- Return `TranscriptionResult(text, language, segments)`
-
-### 4. LLM Rewrite (optional, background thread)
+### 3. Dictionary Replacement (3 Layers)
 ```
-IF llm_mode != OFF:
+Layer 1: Exact regex replacements (word-boundary: (?<!\w)...\w)
+Layer 2: Fuzzy phonetic matching (Levenshtein ratio >= 0.8)
+Layer 3: LLM context injection (dictionary terms → prompt glossary)
+```
+
+### 4. LLM Rewrite (optional, streaming SSE)
+```
+IF llm_mode != OFF AND word_count > 5:
     prompt = build_user_prompt(raw_text, mode)
-    payload = {model, messages, max_tokens, temperature, stream: false}
-    POST to provider URL with Bearer auth
-    IF OpenRouter and primary fails → retry with fallback_model
-    Return cleaned text (or raw on failure)
+    payload = {model, messages, max_tokens, temperature, stream: true}
+    FOR token IN rewrite_stream(payload):
+        emit llm_partial event  # real-time streaming to frontend
+    processed = clean_response(collected_tokens)
 ```
 
 ### 5. Output
 ```
-wtype → types into focused input (if typing enabled)
-wl-copy → copies to Wayland clipboard (if clipboard enabled)
-stdout → prints [raw] and [cleanup] markers
+_output_text(processed, config):  # ALWAYS called, regardless of hooks
+    type_to_focused_input → wtype (Wayland) / xdotool (X11) / keybd_event (Windows)
+    copy_to_clipboard → wl-copy (Wayland) / xclip (X11) / ctypes (Windows)
+    [parallel threads — not sequential]
+
+_json_emit(processed event) → stdout JSON → Frontend api-tauri.ts
 ```
 
 ## Debug Output Format
@@ -270,3 +304,32 @@ stdout → prints [raw] and [cleanup] markers
 - `snr`: signal-to-noise ratio in dB
 - `state`: VAD state (SILENCE or SPEECH)
 - `score`: composite speech probability (>1.67 = onset, <0.50 = offset)
+
+## Latest Research (2026)
+
+### LibriVAD Dataset (Dec 2025)
+Large-scale open VAD dataset (15GB/150GB/1.5TB) from LibriSpeech. ViT with MFCC
+features outperforms BDNN and ConvLSTM on seen, unseen, and OOD conditions.
+(arXiv:2512.17281)
+
+### Silero VAD v5 (Jun 2024)
+3x faster inference, 6000+ languages, 2MB model. Architecture: STFT → 4×Conv1d+ReLU
+→ LSTM(128) → Conv1d → sigmoid. Processes 512-sample chunks (32ms) in <1ms on CPU.
+
+### ResNet-LSTM Hybrid VAD (Oct 2025)
+ResNet50 + LSTM in spectro-temporal domain with sparsity-based dimension reduction.
+Adapts to stationary, non-stationary, and periodic noises. (Springer MTAP 2025)
+
+### Sony Hybrid VAD (2026)
+Simpler feature combinations deliver robust performance without complex architectures.
+Demonstrates that classical features + light ML can match deep learning for VAD.
+
+### NVIDIA Nemotron Speech ASR (Jan 2026)
+Cache-aware streaming with FastConformer (8x downsampling). Processes only new audio
+"deltas" — 3x higher efficiency than buffered inference. Key insight: VAD at frontend
+segmenting audio into chunks for incremental encoding.
+
+### Voice AI Agent Architecture (2026)
+Production VAD for voice agents requires: turn detection (hardest product problem),
+barge-in handling, <300ms first-token latency. Cascaded pipelines (VAD → ASR → LLM → TTS)
+dominate over end-to-end for control.

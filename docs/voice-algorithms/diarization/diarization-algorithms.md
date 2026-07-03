@@ -375,21 +375,26 @@ Audio → sliding window (3s window, 1.5s stride)
 | ECAPA-TDNN | Desplanques et al. | 2020 | Channel attention + multi-layer aggregation for speaker embeddings |
 | TitaNet | Koluguri et al. | 2021 | Global context SE blocks for scalable speaker embeddings |
 | pyannote.audio 2.1 | Bredin | 2023 | End-to-end segmentation with powerset loss |
+| pyannote.audio 4.0 | Bredin | 2026 | Community-1 model, self-hosted option |
 | VBx | Diez et al. | 2020 | Bayesian HMM clustering for diarization refinement |
 | UIS-RNN | Zhang et al. | 2019 | Supervised online speaker clustering |
 | Powerset EEND | Plaquet & Bredin | 2023 | Multi-class formulation for overlap-native diarization |
 | WhisperX | Bain et al. | 2023 | ASR + forced alignment + diarization pipeline |
 | DOVER-Lap | Raj et al. | 2020 | System fusion for overlapping speech diarization |
+| MASV | Liu et al. | 2024 | Mamba + ECAPA-TDNN for global+local speaker verification |
+| TS-VAD+ | Kapadia | 2025 | Transformer + ECAPA-TDNN + WavLM for overlapping speech |
+| Comprehensive Diarization | Singh et al. | 2025 | Pyannote + ECAPA-TDNN + SA-EEND modular pipeline |
 
 ## 8. Key Repositories
 
 | Repository | What | License |
 |------------|------|---------|
-| `pyannote/pyannote-audio` | Gold standard diarization pipeline | MIT |
+| `pyannote/pyannote-audio` | Gold standard diarization pipeline (v4.0) | MIT |
 | `speechbrain/speechbrain` | ECAPA-TDNN + full speaker recognition toolkit | Apache 2.0 |
 | `BUTSpeechFIT/VBx` | Best clustering refinement | Apache 2.0 |
 | `google/uis-rnn` | Online clustering (archived 2026) | Apache 2.0 |
 | `m-bain/whisperX` | ASR + diarization combo | BSD-4 |
 | `huggingface/speechbrain/spkrec-ecapa-voxceleb` | Pre-trained ECAPA-TDNN | Apache 2.0 |
-| `snakers4/silero-vad` | Fastest open VAD | MIT |
+| `snakers4/silero-vad` | Fastest open VAD (v5) | MIT |
 | `juanmc2005/Diart` | Streaming diarization pipeline | MIT |
+| `AnshKapadia/TS-VAD-plus` | Transformer-based diarization with WavLM | MIT |

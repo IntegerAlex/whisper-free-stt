@@ -218,39 +218,57 @@ is_speech = vad.is_speech(frame_bytes, sample_rate=16000)
 
 ## 7. Silero VAD (v5)
 
-**Source:** `github.com/snakers4/silero-vad` (9.3k+ stars)
+**Source:** `github.com/snakers4/silero-vad` (11k+ stars)
 **License:** MIT (LICENSE file), not CC BY-NC 4.0 as badge shows. Verify: https://raw.githubusercontent.com/snakers4/silero-vad/master/LICENSE
+**PyPI:** `pip install silero-vad` (latest: v6.2.0, Nov 2025)
 
-**Architecture:** Lightweight neural network (~2MB quantized JIT model via ONNX).
+**Architecture:** Lightweight neural network (2MB model, ~309K parameters).
+```
+STFT → Conv1d (1→258) → 4×Conv1d+ReLU encoder → LSTM(128) → Conv1d decoder → sigmoid
+```
 
-**Verified Specs:**
-- 30ms chunk processing in <1ms on single CPU thread (from README benchmarks)
-- Supports 8kHz and 16kHz sampling rates
-- Trained on 6000+ languages
-- ONNX Runtime support for 2-5x speedup vs PyTorch
+**v5 Verified Specs:**
+- 3x faster inference for TorchScript, 10% faster for ONNX (vs v4)
+- TorchScript now as fast as ONNX
+- 512-sample chunks (32ms at 16kHz) processed in <1ms on single CPU thread
+- 6000+ languages (up from ~100 in v4)
+- 5-7% quality increase on clean data
+- Significantly more robust on noisy data
+- Quality difference for 8kHz and 16kHz is negligible
+- ONNX opset 16, `window_size_samples` deprecated (fixed 512/256)
 
 **Usage (verified from repo):**
 ```python
-import torch
-torch.set_num_threads(1)
-model, utils = torch.hub.load('snakers4/silero-vad', 'silero_vad')
-(get_speech_timestamps, _, _, _, _) = utils
-speech_timestamps = get_speech_timestamps(wav, model, sampling_rate=16000)
-```
+from silero_vad import load_silero_vad, read_audio
 
-**Streaming (verified from repo examples):**
-```python
-for i in range(0, len(wav), window_size_samples):
-    chunk = wav[i:i+window_size_samples]
+model = load_silero_vad(onnx=True)  # ONNX for 2-5x speedup
+wav = read_audio('example.wav', sampling_rate=16000)
+
+# Batch mode
+speech_timestamps = model.get_speech_timestamps(wav, sampling_rate=16000)
+
+# Streaming mode
+for i in range(0, len(wav), 512):
+    chunk = wav[i:i+512]
     speech_prob = model(chunk, 16000).item()
-    if speech_prob > threshold:
+    if speech_prob > 0.5:
         # speech detected
+        pass
+model.reset_states()
 ```
 
-**Benchmarks (Picovoice benchmarks):**
-- Silero VAD RTF: 0.004
-- Cobra VAD RTF: 0.0005 (8.6x faster)
-- WebRTC VAD RTF: ~0.0001 (fastest, but least accurate at low SNR)
+**Architecture (v5 streaming state machine):**
+```
+silence → pendingSpeech → speech → pendingSilence → silence
+         (onset: 0.5)              (offset: 0.35)
+```
+
+**Benchmarks (Picovoice 2026):**
+- Silero VAD v5 RTF: 0.004
+- Cobra VAD RTF: 0.0005 (8.6x faster, commercial)
+- WebRTC VAD RTF: ~0.0001 (fastest, least accurate)
+
+**Note:** Silero VAD is used internally by faster-whisper for its `vad_filter=True` option.
 
 ---
 
