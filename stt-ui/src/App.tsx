@@ -1012,9 +1012,7 @@ function App() {
       return;
     }
     if (event.type === "dropped") {
-      if (event.reason !== "dedup") {
-        setToast(`Dropped (${event.reason})`);
-      }
+      setToast(`Dropped (${event.reason})`);
       return;
     }
     if (event.type === "info") {
@@ -1023,15 +1021,10 @@ function App() {
     }
     if (event.type === "raw") {
       const id = event.utterance_id ?? nextLocalId.current++;
-      const norm = event.text.trim().toLowerCase();
-      setLines((prev) => {
-        const now = Date.now();
-        const isDup = prev.some(
-          (l) => l.raw.trim().toLowerCase() === norm && now - new Date(l.createdAt).getTime() < 5000
-        );
-        if (isDup) return prev;
-        return [...prev, { id, raw: event.text, processed: "", status: "transcribing", createdAt: new Date().toISOString() }].slice(-500);
-      });
+      setLines((prev) => [
+        ...prev,
+        { id, raw: event.text, processed: "", status: "transcribing", createdAt: new Date().toISOString() },
+      ].slice(-500));
       return;
     }
     if (event.type === "processed") {

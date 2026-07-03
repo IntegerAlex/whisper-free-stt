@@ -10,25 +10,25 @@ cd "$PROJECT_DIR"
 
 TARGETS=""
 
-# Check each bundler
-command -v dpkg-deb &>/dev/null && TARGETS="${TARGETS:+$TARGETS,}deb"
-command -v rpmbuild &>/dev/null && TARGETS="${TARGETS:+$TARGETS,}rpm"
-command -v appimagetool &>/dev/null && TARGETS="${TARGETS:+$TARGETS,}appimage"
+case "$(uname -s)" in
+  Linux)
+    command -v dpkg-deb &>/dev/null && TARGETS="${TARGETS:+$TARGETS,}deb"
+    command -v rpmbuild &>/dev/null && TARGETS="${TARGETS:+$TARGETS,}rpm"
+    command -v appimagetool &>/dev/null && TARGETS="${TARGETS:+$TARGETS,}appimage"
+    ;;
+  Darwin)
+    command -v hdiutil &>/dev/null && TARGETS="${TARGETS:+$TARGETS,}dmg"
+    ;;
+  MINGW*|MSYS*|CYGWIN*)
+    TARGETS="nsis"
+    ;;
+esac
 
-# macOS
-command -v hdiutil &>/dev/null && TARGETS="${TARGETS:+$TARGETS,}dmg"
-
-# Windows (cross-compile or native)
-[[ "$OSTYPE" == "msys" || "$OSTYPE" == "cygwin" ]] && TARGETS="${TARGETS:+$TARGETS,}nsis"
-
-# Fallback: at least deb
-TARGETS="${TARGETS:-deb}"
+if [ -z "$TARGETS" ]; then
+  echo "Error: no installers available for $(uname -s). Install dpkg-deb, rpmbuild, or appimagetool." >&2
+  exit 1
+fi
 
 echo "Building bundles: $TARGETS"
-
-# Node 20 for Vite 7
-if [[ -d "/tmp/node-v20.19.0-linux-x64/bin" ]]; then
-  export PATH="/tmp/node-v20.19.0-linux-x64/bin:$PATH"
-fi
 
 exec npx tauri build --bundles "$TARGETS" "$@"

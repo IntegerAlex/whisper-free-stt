@@ -150,6 +150,7 @@ _SILENCE_HALLUCINATIONS = frozenset({
 # ---------------------------------------------------------------------------
 
 _recent_raw_texts: deque[tuple[str, float]] = deque(maxlen=20)
+_recent_raw_texts_lock = threading.Lock()
 _RAW_DEDUP_WINDOW_SEC = 5.0  # seconds within which duplicate text is suppressed
 
 
@@ -1139,16 +1140,18 @@ def _transcribe_and_print(
     except Exception as exc:
         logger.warning("Dictionary fuzzy replacement failed: %s", exc)
 
-    # --- Dedup: suppress same text emitted within _RAW_DEDUP_WINDOW_SEC ---
+    # --- Dedup: log same text emitted within _RAW_DEDUP_WINDOW_SEC (advisory, never blocks) ---
     now_mono = time.monotonic()
     raw_norm = _normalize_text(asr_text)
-    _recent_texts_snapshot = list(_recent_raw_texts)
-    for _prev_text, _prev_ts in _recent_texts_snapshot:
-        if _normalize_text(_prev_text) == raw_norm and (now_mono - _prev_ts) < _RAW_DEDUP_WINDOW_SEC:
-            _debug(config, f"dedup: suppressed duplicate raw: {asr_text[:60]!r}")
-            _json_emit(config, {"type": "dropped", "utterance_id": utterance_id, "reason": "dedup", "duration_sec": round(len(audio) / sr, 3)})
-            return
-    _recent_raw_texts.append((asr_text, now_mono))
+    _is_dup = False
+    with _recent_raw_texts_lock:
+        for _prev_text, _prev_ts in list(_recent_raw_texts):
+            if _normalize_text(_prev_text) == raw_norm and (now_mono - _prev_ts) < _RAW_DEDUP_WINDOW_SEC:
+                _is_dup = True
+                break
+        _recent_raw_texts.append((asr_text, now_mono))
+    if _is_dup:
+        _debug(config, f"dedup: repeated text within {_RAW_DEDUP_WINDOW_SEC}s: {asr_text[:60]!r}")
 
     # Don't duplicate partial output if the final raw matches what we already showed
     if partials and raw.strip() == partials[-1].strip():
