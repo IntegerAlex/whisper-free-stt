@@ -82,7 +82,7 @@ export interface RuntimeSettings {
 
 const DEFAULT_SETTINGS: RuntimeSettings = {
   wsPort: 8765,
-  asrProfile: "balanced",
+  asrProfile: "auto",
   backend: "auto",
   model: "",
   llmMode: "cleanup",
@@ -806,7 +806,7 @@ function App() {
   const startRef = useRef<(overrideSettings?: RuntimeSettings, source?: string) => void>(() => {});
   const stopRef = useRef<() => void>(() => {});
   const [settingsVersion, setSettingsVersion] = useState(0);
-  const [hotkey, setHotkey] = useState(() => localStorage.getItem("stt-hotkey") || "CommandOrControl+Shift+Space");
+  const [hotkey] = useState(() => localStorage.getItem("stt-hotkey") || "CommandOrControl+Shift+Space");
 
 
   connectedRef.current = connected;
@@ -1133,7 +1133,6 @@ function App() {
 
   useEffect(() => {
     let unlisten: (() => void) | undefined;
-    let unlistenShortcut: (() => void) | undefined;
     let registeredShortcut: string | null = null;
     (async () => {
       try {

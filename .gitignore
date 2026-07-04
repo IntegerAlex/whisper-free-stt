@@ -34,3 +34,8 @@ package-lock.json
 # Tauri
 stt-ui/src-tauri/gen/
 stt-ui/dist/
+
+# Agent tooling (not project code)
+.mimocode/
+.commandcode/
+.agents/

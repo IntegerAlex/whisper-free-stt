@@ -80,7 +80,13 @@ addopts = "-v --tb=short"
 
 [dependency-groups]
 dev = [
+    "datasets>=5.0.0",
+    "jiwer>=4.0.0",
+    "matplotlib>=3.10.9",
     "pyinstaller>=6.20.0",
     "pytest>=9.1.1",
     "ruff>=0.8.0",
+    "soundfile>=0.14.0",
+    "tinytex>=0.2.0",
+    "torchcodec>=0.14.0",
 ]

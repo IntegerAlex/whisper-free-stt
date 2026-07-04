@@ -84,3 +84,40 @@ All citations verified against actual papers and source code.
 | 46 | Reddit r/MachineLearning | https://reddit.com/r/MachineLearning |
 | 47 | Reddit r/LocalLLaMA | https://reddit.com/r/LocalLLaMA |
 | 48 | Reddit r/speechprocessing | https://reddit.com/r/speechprocessing |
+
+## 2025-2026 Additions
+
+### VAD
+
+| # | Paper | Authors | Year | DOI / Verified Link |
+|---|-------|---------|------|---------------------|
+| 49 | LibriVAD: A Scalable Open Dataset with Deep Learning Benchmarks for VAD | Stylianou, Sarkar, Dawalatabad, Glass, Tan | 2025 | https://arxiv.org/abs/2512.17281 |
+| 50 | A voice activity detection algorithm using deep learning in time–frequency domain | Mavaddati | 2025 | 10.1007/s00521-024-10795-x, Neural Computing and Applications 37, 2581–2595 |
+| 51 | A ResNet-LSTM hybrid deep learning approach for VAD in the spectro-temporal domain | Mavaddati, Razavi | 2025 | 10.1007/s11042-025-21118-0, Multimedia Tools and Applications 84, 50629–50654 |
+| 52 | Enhancing VAD in Noisy Environments Using Deep Neural Networks | Nagaraja, Yadava | 2025 | 10.1007/s00034-025-03055-3, Circuits, Systems, and Signal Processing 44, 5220–5234 |
+
+### ASR
+
+| # | Paper | Authors | Year | Verified Link |
+|---|-------|---------|------|---------------|
+| 53 | Whisper large-v3-turbo: Pruned decoder (32→4 layers) | OpenAI | 2024 | https://huggingface.co/openai/whisper-large-v3-turbo |
+| 54 | NVIDIA Nemotron Speech ASR: Cache-aware streaming | NVIDIA | 2026 | https://huggingface.co/nvidia/nemotron-speech-streaming-en-0.6b |
+| 55 | ASR in the Modern Era: Architectures, Training, and Evaluation (Survey) | Tabrej et al. | 2025 | https://arxiv.org/abs/2510.12827 |
+
+### Speaker Diarization
+
+| # | Paper | Authors | Year | DOI / Verified Link |
+|---|-------|---------|------|---------------------|
+| 56 | A Comprehensive Speaker Diarization System: Pyannote + ECAPA-TDNN + SA-EEND | Singh et al. | 2025 | 10.1007/978-3-032-06665-7_45, ICT4SD 2025 |
+| 57 | MASV: Speaker Verification with Global and Local Context Mamba | Liu, Wan, Huang, Metze | 2024 | ResearchGate preprint |
+
+### Production Systems
+
+| # | Resource | Source | Year | Verified URL |
+|---|----------|--------|------|--------------|
+| 58 | faster-whisper 1.1.0 | SYSTRAN | 2025 | https://github.com/SYSTRAN/faster-whisper (MIT) |
+| 59 | faster-whisper2 | BBC-Esq | 2026 | https://github.com/BBC-Esq/faster-whisper2 (MIT) |
+| 60 | whisper.cpp 1.8.3 (Vulkan iGPU) | ggerganov | 2026 | https://github.com/ggerganov/whisper.cpp (MIT) |
+| 61 | pyannote 4.0 (Community-1) | pyannote.ai | 2026 | https://docs.pyannote.ai/models |
+| 62 | Silero VAD v5 (6000+ languages) | snakers4 | 2024 | https://github.com/snakers4/silero-vad (MIT) |
+| 63 | CrispASR (Cohere Transcribe, Parakeet TDT) | CrispStrobe | 2026 | https://github.com/CrispStrobe/CrispASR (MIT) |
