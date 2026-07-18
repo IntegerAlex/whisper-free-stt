@@ -190,7 +190,7 @@ class StreamingEndpointDetector:
 
         # --- Thresholds (SNR-based, adaptive) ---
         self._speech_threshold_db = 6.0    # SNR threshold for speech
-        self._hysteresis_up_db = 4.0       # Onset margin (harder to start)
+        self._hysteresis_up_db = 2.0       # Onset margin (lower = more sensitive)
         self._hysteresis_down_db = 3.0     # Offset margin (easier to stay)
         self._endpoint_timeout_ms = 500    # Silence before speech end
         self._min_speech_ms = 50           # Minimum speech duration
@@ -484,33 +484,28 @@ class StreamingEndpointDetector:
         self._silence_duration_ms = 0
         return event
 
+    def force_end(self, end_sample: int) -> VADEvent | None:
+        """Immediately finalize an in-progress speech segment, without waiting
+        for trailing silence.
 
-# ---------------------------------------------------------------------------
-# Legacy factory (kept for one-shot mode compatibility)
-# ---------------------------------------------------------------------------
+        Used when the caller is stopping the mic stream externally (e.g. the
+        user released a push-to-talk key). Normal endpointing requires ~500ms
+        of silence after speech before `update()` emits an "end" event; if the
+        stream is torn down before that silence arrives, the in-progress
+        utterance would otherwise be silently discarded. Call this right
+        before closing the mic stream so the last thing the user said is
+        still transcribed.
 
-def make_speech_detector(config: VADConfig):
-    thresh = config.silence_threshold_rms
-    silence_samples = int(config.silence_duration_sec * 16000)
-    min_samples = int(config.min_recording_sec * 16000)
-    _cell: list[int] = [-1]
-
-    def is_speech(chunk, sr):
-        return compute_rms(chunk) > thresh
-
-    def should_stop(accumulated):
-        n = len(accumulated)
-        if n == 0: return False
-        tail = accumulated[-4096:]
-        rms = compute_rms(tail)
-        if rms > thresh: _cell[0] = n; return False
-        if _cell[0] < 0: _cell[0] = 0
-        if (n - _cell[0]) >= silence_samples and n >= min_samples: return True
-        return False
-
-    def reset(): _cell[0] = -1
-    return is_speech, should_stop, reset
-
-
-def is_silent(segment: AudioSegment, threshold: float) -> bool:
-    return compute_rms(segment.data) < threshold
+        Returns None if no speech was in progress, or if the in-progress
+        speech is shorter than the configured minimum.
+        """
+        if not self._in_speech:
+            return None
+        speech_samples = end_sample - self._speech_start_sample
+        if speech_samples < self._min_speech_samples:
+            self._in_speech = False
+            self._speech_start_sample = 0
+            self._speech_duration_ms = 0
+            self._silence_duration_ms = 0
+            return None
+        return self._finish_segment(end_sample, forced_split=False)

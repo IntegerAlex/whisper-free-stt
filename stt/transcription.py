@@ -27,6 +27,39 @@ _faster_whisper_cache: dict[str, "object"] = {}  # faster_whisper.WhisperModel
 _batched_cache: dict[str, "object"] = {}  # BatchedInferencePipeline wrappers
 
 
+def release_backend() -> None:
+    """Drop all cached ASR models to free GPU/CPU memory.
+
+    The ASR model (e.g. large-v3-turbo) is the single largest memory
+    consumer in the process. Under push-to-talk the model is idle the vast
+    majority of the time yet stays resident, pinning several GB of RAM/VRAM
+    for the whole app lifetime. Releasing it on idle and re-warming on the
+    next session reclaims that memory without affecting an active session.
+    """
+    global _whisper_cpp_cache, _faster_whisper_cache, _batched_cache
+    _whisper_cpp_cache.clear()
+    _faster_whisper_cache.clear()
+    _batched_cache.clear()
+    # Release any framework-level allocator caches (ctranslate2 / torch).
+    try:
+        import gc
+        gc.collect()
+    except Exception:
+        pass
+    try:
+        import ctranslate2
+        if hasattr(ctranslate2, "clear_cache"):
+            ctranslate2.clear_cache()
+    except Exception:
+        pass
+    try:
+        import torch
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+    except Exception:
+        pass
+
+
 def _get_cpp_model(config: TranscriptionConfig):
     """Return cached whisper.cpp model."""
     from pywhispercpp.model import Model as CppModel
@@ -166,6 +199,8 @@ def transcribe(
 
 def warm_up_backend(config: TranscriptionConfig) -> None:
     """Preload model weights to avoid first-utterance cold-start latency."""
+    import time
+    t0 = time.monotonic()
     try:
         if config.backend is TranscriptionBackend.WHISPER_CPP:
             _get_cpp_model(config)
@@ -175,8 +210,12 @@ def warm_up_backend(config: TranscriptionConfig) -> None:
             batch_size = config.batch_size if config.batch_size > 0 else (8 if config.device == "cuda" else 0)
             if batch_size > 0:
                 _get_batched_model(config)
+        # Pre-import noisereduce so first transcription isn't blocked by lazy import
+        if config.noise_reduce:
+            import noisereduce  # noqa: F401
     except Exception as exc:
         logger.warning("Warm-up failed (non-fatal): %s", exc)
+    logger.info("Warm-up complete (%.1fs)", time.monotonic() - t0)
 
 
 # ---------------------------------------------------------------------------

@@ -46,27 +46,72 @@ export default function OverlayView() {
   // Listen for overlay commands from the frontend (main window)
   useEffect(() => {
     let unlisten: (() => void) | undefined;
+    let retries = 0;
+    const MAX_RETRIES = 5;
+    const RETRY_DELAY = 200;
 
-    (async () => {
+    const tryListen = async (): Promise<boolean> => {
       try {
         const { listen } = await import("@tauri-apps/api/event");
 
         unlisten = await listen<OverlayState>("overlay:command", (event) => {
           const newState = event.payload;
+          console.log(`[Overlay] Received command: ${newState}`);
           setState(newState);
 
-          // Start/stop waveform based on listening state
-          const shouldCapture = newState === "listening";
-          if (shouldCapture && waveformRef.current && !waveformRef.current.isActive()) {
+          // Start waveform
+          if (newState === "listening" && waveformRef.current && !waveformRef.current.isActive()) {
+            console.log("[Overlay] Starting waveform");
             waveformRef.current.start();
-          } else if (!shouldCapture && waveformRef.current?.isActive()) {
+          }
+
+          // Stop waveform
+          if (newState !== "listening" && waveformRef.current?.isActive()) {
+            console.log("[Overlay] Stopping waveform");
             waveformRef.current.stop();
           }
+
+          // Full cleanup — reset to initial state, then signal ready
+          if (newState === "idle") {
+            console.log("[Overlay] Cleaning up");
+            waveformRef.current?.stop();
+            scaleSpring.setValue(0);
+
+            // Reset SVG bars to minimum height
+            const svg = svgRef.current;
+            if (svg) {
+              const bars = svg.querySelectorAll("rect");
+              bars.forEach((bar) => {
+                bar.setAttribute("y", "11");
+                bar.setAttribute("height", "2");
+              });
+            }
+
+            rendererInitRef.current = false;
+            console.log("[Overlay] Cleanup complete");
+
+            // Acknowledge cleanup — App.tsx waits for this before hiding
+            import("@tauri-apps/api/event").then(({ emitTo }) => {
+              emitTo("main", "overlay:idle_ready", {});
+              console.log("[Overlay] Sent idle_ready");
+            }).catch(() => {});
+          }
         });
+        return true;
       } catch {
-        // Not in Tauri — show a static pill for development
-        setState("listening");
+        return false;
       }
+    };
+
+    (async () => {
+      while (retries < MAX_RETRIES) {
+        if (await tryListen()) return;
+        retries++;
+        if (retries < MAX_RETRIES) {
+          await new Promise((r) => setTimeout(r, RETRY_DELAY));
+        }
+      }
+      console.warn("[Overlay] Failed to register listener after retries — staying idle");
     })();
 
     return () => {

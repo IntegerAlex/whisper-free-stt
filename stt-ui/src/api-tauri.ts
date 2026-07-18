@@ -40,29 +40,52 @@ export function getWebAudioAnalyser(): AnalyserNode | null {
 export function createTauriApi(args: string[], sidecarName: string = "binaries/stt-engine"): STTApi {
   let listeners: Array<(e: STTEvent) => void> = [];
   let child: Child | null = null;
-  let lineBuffer = ""; // Buffer for partial JSON lines across chunk boundaries
+  // IMPORTANT: stdout and stderr are two independent, asynchronously-arriving
+  // streams — stdout carries the line-delimited JSON event protocol
+  // (`_json_emit` in the Python backend), stderr carries plain-text log
+  // lines from the `logging` module. They MUST use separate buffers. A
+  // previous version of this code buffered both streams through a single
+  // shared `lineBuffer`, so if a stderr "data" event fired in between two
+  // stdout chunks (or vice versa), fragments from the two unrelated streams
+  // got concatenated together before the next newline — corrupting the
+  // JSON line so it silently failed to parse and the event was dropped
+  // (with only a garbled fallback console.log/warn, no error surfaced).
+  // This caused state/transcript events (e.g. "transcribing", the final
+  // transcript, or "idle") to intermittently vanish depending on exact
+  // timing — the exact kind of "works most of the time, randomly fails"
+  // behavior reported for PTT.
+  let stdoutBuffer = "";
+  let stderrBuffer = "";
 
   const notifyError = (msg: string) => {
     for (const cb of listeners) cb({ type: "error", message: msg });
   };
 
-  const handleLine = (source: string, data: string) => {
-    lineBuffer += data;
-    const lines = lineBuffer.split("\n");
-    // Keep the last (potentially incomplete) chunk in the buffer
-    lineBuffer = lines.pop() ?? "";
-    for (const raw of lines) {
-      const trimmed = raw.trim();
-      if (!trimmed) continue;
-      try {
-        const event: STTEvent = JSON.parse(trimmed);
-        for (const cb of listeners) cb(event);
-      } catch {
-        if (source === "stderr") {
-          console.warn(`[Sidecar stderr] ${trimmed}`);
-        } else {
+  const handleLine = (source: "stdout" | "stderr", data: string) => {
+    if (source === "stdout") {
+      stdoutBuffer += data;
+      const lines = stdoutBuffer.split("\n");
+      // Keep the last (potentially incomplete) chunk in the buffer
+      stdoutBuffer = lines.pop() ?? "";
+      for (const raw of lines) {
+        const trimmed = raw.trim();
+        if (!trimmed) continue;
+        try {
+          const event: STTEvent = JSON.parse(trimmed);
+          for (const cb of listeners) cb(event);
+        } catch {
           console.log(`[Sidecar stdout] ${trimmed}`);
         }
+      }
+    } else {
+      stderrBuffer += data;
+      const lines = stderrBuffer.split("\n");
+      stderrBuffer = lines.pop() ?? "";
+      for (const raw of lines) {
+        const trimmed = raw.trim();
+        if (!trimmed) continue;
+        // stderr is plain-text logging, never JSON — no parse attempt needed.
+        console.warn(`[Sidecar stderr] ${trimmed}`);
       }
     }
   };

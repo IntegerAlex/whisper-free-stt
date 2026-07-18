@@ -1,27 +1,10 @@
-use tauri::{AppHandle, Emitter, Manager};
+use tauri::{AppHandle, Manager};
 
 // ---------------------------------------------------------------------------
 // Backend commands — the backend is a pure execution engine.
 // It never decides when to start, stop, show, hide, or type.
 // The frontend owns every decision.
 // ---------------------------------------------------------------------------
-
-/// Tell the sidecar to begin capturing audio.
-/// The frontend calls this only after transitioning to Listening.
-#[tauri::command]
-pub fn begin_capture(app: AppHandle) -> Result<(), String> {
-    // Emit to the main window so the STTApi can send "start_recording" to the sidecar
-    let _ = app.emit("backend:begin_capture", ());
-    Ok(())
-}
-
-/// Tell the sidecar to stop capturing audio.
-/// The frontend calls this when the user releases the hotkey.
-#[tauri::command]
-pub fn end_capture(app: AppHandle) -> Result<(), String> {
-    let _ = app.emit("backend:end_capture", ());
-    Ok(())
-}
 
 /// Insert text into the focused window.
 /// Uses Win32 clipboard + Ctrl+V (with SendInput Unicode fallback).

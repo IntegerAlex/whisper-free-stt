@@ -3,7 +3,7 @@ import { Maximize2, X } from "lucide-react";
 import { MicIcon } from "./icons/MicIcon";
 import { MicOffIcon } from "./icons/MicOffIcon";
 import { LanguagesIcon } from "./icons/LanguagesIcon";
-import { listen, emit } from "@tauri-apps/api/event";
+import { listen, emitTo } from "@tauri-apps/api/event";
 import { invoke } from "@tauri-apps/api/core";
 
 type WidgetStatus = "idle" | "listening" | "transcribing" | "rewriting" | "error";
@@ -147,12 +147,12 @@ export default function WidgetView() {
 
   const handleToggle = useCallback(async () => {
     if (!isTauri()) return;
-    await emit("widget-toggle");
+    await emitTo("main", "widget-toggle");
   }, []);
 
   const handleShowMain = useCallback(async () => {
     if (!isTauri()) return;
-    await emit("widget-show-main");
+    await emitTo("main", "widget-show-main");
     setShowMenu(false);
   }, []);
 

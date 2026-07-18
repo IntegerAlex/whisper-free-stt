@@ -36,7 +36,7 @@ logger = get_logger(__name__)
 from stt.audio_capture import mic_stream, find_default_microphone, find_best_microphone
 from stt.speaker import SpeakerVerifier
 from stt.vad import (
-    compute_rms, StreamingEndpointDetector,
+    compute_rms, StreamingEndpointDetector, VADEvent,
     compute_spectral_centroid, compute_spectral_flux,
     compute_zero_crossing_rate, compute_band_energy_ratio,
 )
@@ -79,6 +79,52 @@ def _debug(config: AppConfig, *args, **kwargs) -> None:
 _ws_clients: list = []
 _ws_loop = None  # set by start_ws_server
 
+# Pending idle model-release timer (see _schedule_idle_release / _cancel_idle_release).
+# The ASR model is the dominant memory user; we free it a short grace period
+# after the user stops dictating, then re-warm on the next session.
+_idle_release_timer: threading.Timer | None = None
+_IDLE_RELEASE_GRACE_SEC = float(os.environ.get("STT_IDLE_RELEASE_SEC", "20"))
+
+
+def _cancel_idle_release() -> None:
+    """Cancel a pending idle model-release (called when a new session starts)."""
+    global _idle_release_timer
+    timer = _idle_release_timer
+    if timer is not None:
+        timer.cancel()
+        _idle_release_timer = None
+
+
+def _schedule_idle_release() -> None:
+    """Free the ASR model after a grace period of continued idleness.
+
+    Releasing the model reclaims several GB of RAM/VRAM that would otherwise
+    stay pinned for the entire app lifetime under push-to-talk. If a new
+    session starts before the timer fires, _cancel_idle_release() aborts it
+    and the warm model is reused (no latency cost).
+    """
+    global _idle_release_timer
+    _cancel_idle_release()
+    if _IDLE_RELEASE_GRACE_SEC <= 0:
+        return
+
+    def _release():
+        global _idle_release_timer
+        _idle_release_timer = None
+        try:
+            from stt.transcription import release_backend
+            release_backend()
+            logger.info("idle: released ASR model to free memory")
+        except Exception:
+            pass
+
+    try:
+        _idle_release_timer = threading.Timer(_IDLE_RELEASE_GRACE_SEC, _release)
+        _idle_release_timer.daemon = True
+        _idle_release_timer.start()
+    except Exception:
+        pass
+
 
 async def _ws_broadcast(payload: str) -> None:
     """Send payload to all connected WS clients (async)."""
@@ -117,7 +163,7 @@ def _json_emit(config: AppConfig, event: dict) -> None:
         logger.warning("dropped", reason=event.get("reason"), utterance_id=event.get("utterance_id"))
     else:
         logger.debug("event", type=event_type, payload=payload[:200])
-    # Print to stdout for frontend consumption
+    # Print to stdout for frontend consumption.
     if config.json_mode:
         print(payload, flush=True)
     # Try legacy WebSocket broadcast
@@ -361,20 +407,30 @@ class _RingBuffer:
         self._total = 0
 
     def extend(self, chunk: np.ndarray) -> None:
-        n = len(chunk)
-        if n >= self._max:
-            self._buf[:] = chunk[-self._max:]
-            self._total += n
-            return
-        pos = self._total % self._max
-        self._total += n
-        end = pos + n
+        total_n = len(chunk)
+        write_n = min(total_n, self._max)
+        if write_n < total_n:
+            # Only the tail fits; the rest is older than the buffer's
+            # capacity and would be evicted immediately anyway.
+            chunk = chunk[-write_n:]
+        # `_total` must track the true cumulative sample count (other code
+        # uses total_samples() as an absolute sample-index counter), even
+        # when only the tail of an oversized chunk is physically written.
+        # The write position is derived from the absolute index of the
+        # first *written* sample, not from the old total directly — writing
+        # at `old_total % max` would misalign the circular pointer relative
+        # to slice_range()'s `sample_index % max` invariant.
+        old_total = self._total
+        self._total += total_n
+        write_start_abs = old_total + (total_n - write_n)
+        pos = write_start_abs % self._max
+        end = pos + write_n
         if end <= self._max:
             self._buf[pos:end] = chunk
         else:
             first = self._max - pos
             self._buf[pos:] = chunk[:first]
-            self._buf[:n - first] = chunk[first:]
+            self._buf[:write_n - first] = chunk[first:]
 
     def slice_range(self, start_sample: int, end_sample: int) -> np.ndarray:
         """Return a copy of samples [start_sample, end_sample)."""
@@ -548,29 +604,80 @@ def run(
     _is_tty = sys.stdin.isatty()
 
     def _stdin_reader():
-        """Read JSON commands from stdin (one per line)."""
+        """Read JSON commands from stdin (one per line).
+
+        Uses os.read() on the raw file descriptor (fd 0) instead of the
+        sys.stdin iterator — the Python text-mode wrapper on Windows pipes
+        can buffer incomplete lines and never flush, causing the reader
+        thread to block indefinitely on partial reads.
+        """
         nonlocal _stdin_alive
+        _fd = 0  # stdin file descriptor
+        _buf = b""
+        logger.info("stdin_reader: thread started (fd=%d, tty=%s)", _fd, _is_tty)
         try:
-            for line in sys.stdin:
-                line = line.strip()
-                if not line:
-                    continue
-                try:
-                    cmd = _json.loads(line)
-                    if cmd.get("type") == "start_recording":
-                        _start_event.set()
-                    elif cmd.get("type") == "stop_recording":
-                        _stop_event.set()
-                        _start_event.set()  # Also unblocks if waiting
-                except _json.JSONDecodeError:
-                    pass
-        except (EOFError, OSError):
-            pass
+            while True:
+                chunk = os.read(_fd, 4096)
+                if not chunk:
+                    logger.info("stdin_reader: EOF received (pipe closed)")
+                    break
+                _buf += chunk
+                while b"\n" in _buf:
+                    line_bytes, _buf = _buf.split(b"\n", 1)
+                    line = line_bytes.decode("utf-8", errors="replace").strip()
+                    if not line:
+                        continue
+                    logger.info("stdin_reader: received %d bytes: %s", len(line_bytes), line[:200])
+                    try:
+                        cmd = _json.loads(line)
+                        cmd_type = cmd.get("type", "")
+                        if cmd_type == "start_recording":
+                            # Clear any stale stop from a previous session.
+                            # If stop_recording was queued in the stdin pipe
+                            # (e.g. user released hotkey while the backend was
+                            # still processing the previous session), it would
+                            # set _stop_event. The new start_recording must
+                            # clear it so calibration doesn't see a phantom
+                            # stop and bail with 0 chunks.
+                            if _stop_event.is_set():
+                                logger.info("stdin_reader: clearing stale _stop_event before start")
+                            _stop_event.clear()
+                            logger.info("stdin_reader: → setting _start_event")
+                            _start_event.set()
+                        elif cmd_type == "stop_recording":
+                            logger.info("stdin_reader: → setting _stop_event")
+                            _stop_event.set()
+                            # NOTE: intentionally NOT setting _start_event here.
+                            # _start_event.wait() (top of the PTT loop) should
+                            # only ever be unblocked by a genuine start_recording
+                            # command (or stdin EOF). If a stray/duplicate
+                            # stop_recording arrives while the backend is
+                            # legitimately idle and waiting for the next
+                            # start_recording, setting _start_event here would
+                            # spuriously kick off a phantom recording session
+                            # that the frontend never asked for and will never
+                            # send a matching stop for — it opens the mic,
+                            # calibrates, sits in "listening" forever, and the
+                            # frontend eventually times out waiting for an
+                            # "idle" event that was never coming for the real
+                            # session. This was the root cause of PTT sessions
+                            # getting stuck / producing no transcript after a
+                            # quick or duplicate release.
+                        else:
+                            logger.info("stdin_reader: unknown command type=%s", cmd_type)
+                    except _json.JSONDecodeError as exc:
+                        logger.warning("stdin_reader: JSON decode error: %s — raw=%s", exc, line[:200])
+        except OSError as exc:
+            logger.error("stdin_reader: OSError: %s", exc)
+        except Exception as exc:
+            logger.error("stdin_reader: unexpected error: %s", exc)
         _stdin_alive = False
+        logger.info("stdin_reader: thread exiting (setting _start_event)")
         _start_event.set()  # Unblock main thread if waiting on start
 
     stdin_thread = threading.Thread(target=_stdin_reader, daemon=True)
     stdin_thread.start()
+    logger.info("stdin_reader: thread launched (daemon=%s, alive=%s)", stdin_thread.daemon, stdin_thread.is_alive())
 
     if _is_tty:
         # Interactive terminal — auto-start recording immediately
@@ -580,9 +687,16 @@ def run(
     sr = config.audio.sample_rate
     block_size = config.audio.blocksize
 
-    # Warm the selected ASR backend in parallel with calibration.
-    warmup_thread = threading.Thread(target=warm_up_backend, args=(config.transcription,), daemon=True)
+    # Warm the selected ASR backend (model loading can take 10-20s on first use).
+    # Run in a thread so frontend can connect in parallel.
+    def _warmup_target(cfg):
+        try:
+            warm_up_backend(cfg)
+        finally:
+            pass
+    warmup_thread = threading.Thread(target=_warmup_target, args=(config.transcription,), daemon=True)
     warmup_thread.start()
+    _echo("ASR warm-up started (model loading)...")
 
     # --- Speaker enrollment (deferred for non-TTY: done after start_recording) ---
     speaker_verifier: SpeakerVerifier | None = None
@@ -609,14 +723,36 @@ def run(
     _active_xcribe_threads: list[threading.Thread] = []
 
     while _stdin_alive or _is_tty:
+        logger.info("PTT loop: _stdin_alive=%s, _is_tty=%s, _start_event=%s, _stop_event=%s",
+                     _stdin_alive, _is_tty, _start_event.is_set(), _stop_event.is_set())
         if not _is_tty:
             _start_event.wait()
+            logger.info("PTT loop: _start_event.wait() returned — _stdin_alive=%s, _stop_event=%s",
+                         _stdin_alive, _stop_event.is_set())
             if not _stdin_alive:
                 _echo("Received stop before start — exiting.")
                 return
         else:
             if not running:
                 break
+
+        # A new session is starting — keep the (possibly still warm) model.
+        _cancel_idle_release()
+
+        # If the model was released during the previous idle period, re-warm it
+        # in the background. The 1.5s calibration window covers most of the
+        # load time; if it isn't ready, the first transcription reloads cold.
+        try:
+            if _idle_release_timer is None:
+                _warmup_thread = threading.Thread(
+                    target=_warmup_target, args=(config.transcription,), daemon=True
+                )
+                _warmup_thread.start()
+        except Exception:
+            pass
+
+        # NOTE: Warmup runs in background. If not done yet, first transcription
+        # will be slow but the mic opens immediately — no blocking here.
 
         # --- Open mic + calibrate (only after start_recording) ---
         ring = _RingBuffer(int(30 * sr))
@@ -632,10 +768,21 @@ def run(
         calib_flux: list[float] = []
         calib_zcr: list[float] = []
         calib_ber: list[float] = []
+        session_start_sample = ring.total_samples()
         try:
             stream_iter = mic_stream(config.audio, debug=False)
+            logger.info("Mic stream opened successfully")
             deadline = time.monotonic() + 1.5
             while time.monotonic() < deadline:
+                if _stop_event.is_set():
+                    # PTT was already released before calibration finished
+                    # (a fast, natural press-speak-release cycle). Stop
+                    # collecting immediately instead of blocking the user
+                    # for the rest of the 1.5s window — the audio captured
+                    # so far is still in `ring` and will be handled by the
+                    # quick-tap fallback below.
+                    logger.info("Calibration interrupted by stop_recording (%d chunks collected)", len(calib_rms))
+                    break
                 chunk = next(stream_iter)
                 ring.extend(chunk)
                 calib_rms.append(compute_rms(chunk))
@@ -662,7 +809,7 @@ def run(
             p10 = sorted_r[len(sorted_r) // 10]
             detector.set_noise_floor(p10)
             st, et = detector.thresholds()
-            _debug(config, f"calibration: p10={p10:.4f}, start_th={st:.4f}, end_th={et:.4f}")
+            logger.info(f"VAD calibration: p10={p10:.4f}, start_th={st:.4f}, end_th={et:.4f}, calib_chunks={len(calib_rms)}")
 
         if calib_centroid and config.vad.use_spectral_vad:
             sorted_c = sorted(calib_centroid)
@@ -675,12 +822,12 @@ def run(
             avg_zcr = float(sorted_z[p10_idx])
             avg_ber = float(sorted_b[p10_idx])
             detector.set_spectral_baselines(avg_centroid, avg_flux, avg_zcr, avg_ber)
-            _debug(config, f"calibration: centroid={avg_centroid:.0f}Hz, flux={avg_flux:.4f}, "
+            logger.info(f"VAD calibration spectral: centroid={avg_centroid:.0f}Hz, flux={avg_flux:.4f}, "
                    f"zcr={avg_zcr:.4f}, ber={avg_ber:.4f}")
 
         # --- Speaker enrollment (on first start only) ---
         if speaker_verifier is None and config.diarization.enabled:
-            from numpy import NDArray
+            from numpy.typing import NDArray
             speaker_verifier = SpeakerVerifier(method=config.diarization.method)
             enrollment_embs: list[NDArray[np.float32]] = []
             n_chunks = config.diarization.enrollment_chunks
@@ -704,16 +851,90 @@ def run(
                 _debug(config, f"speaker enrollment failed: {exc}")
                 speaker_profile = None
 
+        chunk_count = 0
+        utterance_id = 0
+
+        def _dispatch_vad_event(event: VADEvent) -> None:
+            """Turn a VAD 'end' event into a transcription thread, if it
+            passes the minimum-duration and speaker-gate checks."""
+            nonlocal utterance_id
+            segment = ring.slice_range(event.start_sample, event.end_sample)
+            if len(segment) == 0:
+                return
+
+            dur = len(segment) / sr
+            rms_seg = compute_rms(segment)
+            logger.info(f"VAD utterance: {dur:.1f}s, rms={rms_seg:.4f}"
+                    + (" [forced split]" if event.forced_split else ""))
+
+            if dur < config.vad.min_recording_sec:
+                return
+
+            # Speaker gate: reject segments that don't match enrolled speaker
+            if config.diarization.enabled and speaker_verifier is not None and speaker_profile is not None:
+                accepted, score = speaker_verifier.verify(segment, sr, speaker_profile, threshold=config.diarization.similarity_threshold)
+                _json_emit(config, {"type": "speaker", "accepted": accepted, "similarity": round(score, 4)})
+                if not accepted:
+                    _debug(config, f"speaker rejected: sim={score:.3f}")
+                    return
+
+            utterance_id += 1
+            thread = threading.Thread(
+                target=_transcribe_and_print,
+                args=(config, segment.copy(), sr, ring.total_samples() / sr, utterance_id, telemetry, hooks),
+                daemon=True,
+            )
+            _active_xcribe_threads.append(thread)
+            thread.start()
+
+        # --- Quick-tap fallback ---
+        # Calibration (and speaker enrollment, if enabled) can eat up to
+        # ~1.5s+ of audio before the VAD state machine ever runs a single
+        # `detector.update()` call on it. A fast, completely normal
+        # press-speak-release PTT cycle can finish entirely inside that
+        # window: the audio is captured into `ring`, but since VAD never
+        # saw it, `_in_speech` stays False and the later force_end() flush
+        # (see the `finally` block below) has nothing to finalize — the
+        # utterance would otherwise be silently discarded with zero
+        # transcription. If stop_recording already arrived by the time we
+        # get here, treat everything captured this session as one
+        # candidate utterance and dispatch it directly.
+        if _stop_event.is_set():
+            fallback_end = ring.total_samples()
+            if fallback_end > session_start_sample:
+                logger.info(
+                    "PTT released during calibration/enrollment — dispatching "
+                    "%.2fs as fallback utterance",
+                    (fallback_end - session_start_sample) / sr,
+                )
+                _dispatch_vad_event(VADEvent(
+                    kind="end",
+                    start_sample=session_start_sample,
+                    end_sample=fallback_end,
+                    forced_split=False,
+                ))
+
+        # If stop arrived during calibration, close the mic stream NOW so the
+        # recording-loop's `next(stream_iter)` immediately raises StopIteration
+        # instead of blocking forever waiting for audio.  The fallback utterance
+        # (if any) was already dispatched above.
+        if _stop_event.is_set():
+            logger.info("stop_recording arrived during calibration — closing mic before recording loop")
+            try:
+                stream_iter.close()
+            except Exception:
+                pass
+
         _echo("Recording started by frontend.")
         _json_emit(config, {"type": "state", "state": "listening"})
         if hooks and hooks.on_state:
             hooks.on_state("listening")
 
-        chunk_count = 0
-        utterance_id = 0
         try:
             for chunk in stream_iter:
                 if not running or (stop_event is not None and stop_event.is_set()) or _stop_event.is_set():
+                    logger.info("Recording loop: breaking — running=%s, stop_event=%s, _stop_event=%s",
+                                running, stop_event.is_set() if stop_event else "N/A", _stop_event.is_set())
                     break
                 chunk_start = ring.total_samples()
                 ring.extend(chunk)
@@ -725,15 +946,16 @@ def run(
                     _json_emit(config, {"type": "mic", "level": round(rms, 6)})
                 chunk_count += 1
 
-                if config.debug and chunk_count % 8 == 0:
+                if chunk_count % 8 == 0:
                     st, et = detector.thresholds()
                     noise = detector.noise_floor
                     snr_db = 20 * np.log10(rms / max(noise, 1e-10)) if noise > 0 else 0
                     state = detector.vad_state.name
-                    _debug(config, f"rms={rms:.6f} noise={noise:.4f} snr={snr_db:.1f}dB state={state}")
+                    in_speech = detector._in_speech
+                    logger.info(f"VAD: rms={rms:.6f} noise={noise:.4f} snr={snr_db:.1f}dB state={state} in_speech={in_speech} onset_th={st:.4f}")
                     if config.vad.use_spectral_vad:
                         score = detector._compute_speech_score(chunk)
-                        _debug(config, f"  spectral: score={score:.4f}")
+                        logger.info(f"  spectral: score={score:.4f}")
 
                 event = detector.update(
                     rms=rms,
@@ -743,63 +965,66 @@ def run(
                 )
                 if event is None or event.kind == "start":
                     if event:
-                        _debug(config, f"speech start at {event.start_sample/sr:.2f}s")
+                        logger.info(f"VAD: speech START at {event.start_sample/sr:.2f}s")
                     continue
                 if event.end_sample is None:
                     continue
 
-                segment = ring.slice_range(event.start_sample, event.end_sample)
-                if len(segment) == 0:
-                    continue
-
-                dur = len(segment) / sr
-                rms_seg = compute_rms(segment)
-                _debug(config, f"utterance: {dur:.1f}s, rms={rms_seg:.4f}"
-                        + (" [forced split]" if event.forced_split else ""))
-
-                if dur < config.vad.min_recording_sec:
-                    continue
-
-                # Speaker gate: reject segments that don't match enrolled speaker
-                if config.diarization.enabled and speaker_verifier is not None and speaker_profile is not None:
-                    accepted, score = speaker_verifier.verify(segment, sr, speaker_profile, threshold=config.diarization.similarity_threshold)
-                    _json_emit(config, {"type": "speaker", "accepted": accepted, "similarity": round(score, 4)})
-                    if not accepted:
-                        _debug(config, f"speaker rejected: sim={score:.3f}")
-                        continue
-
-                utterance_id += 1
-                thread = threading.Thread(
-                    target=_transcribe_and_print,
-                    args=(config, segment.copy(), sr, ring.total_samples() / sr, utterance_id, telemetry, hooks),
-                    daemon=True,
-                )
-                _active_xcribe_threads.append(thread)
-                thread.start()
+                _dispatch_vad_event(event)
 
         except KeyboardInterrupt:
             break
         finally:
-            pass  # Don't close stream_iter — reuse across PTT sessions
+            # Flush any utterance still in progress (e.g. the user released
+            # PTT right after finishing their sentence, before the VAD's
+            # ~500ms trailing-silence window elapsed). Without this, the
+            # last thing the user said is silently discarded instead of
+            # transcribed — normal endpointing never fires because the mic
+            # stream is about to be torn down.
+            try:
+                flush_event = detector.force_end(ring.total_samples())
+                if flush_event is not None:
+                    logger.info(
+                        "VAD: force-flushing in-progress speech on stop (%.2fs)",
+                        (flush_event.end_sample - flush_event.start_sample) / sr,
+                    )
+                    _dispatch_vad_event(flush_event)
+            except Exception:
+                logger.exception("VAD flush-on-stop failed")
 
-        # --- Wait for pending transcription threads before going idle ---
-        # This ensures pttTextRef has the latest transcription when the
-        # frontend reads it after receiving state:idle.
+            # Close mic stream to stop audio capture and prevent input overflow.
+            # A new stream is opened at the start of each PTT session.
+            try:
+                if stream_iter is not None:
+                    stream_iter.close()
+            except Exception:
+                pass
+
+        # --- Wait for in-flight transcription threads before emitting idle ---
+        # The `processed` event (which carries the final text the frontend
+        # types) is emitted from inside the transcription thread. If we emit
+        # `idle` immediately, the frontend commits text before the transcript
+        # exists (pttTextRef still empty) → "Nothing to commit", nothing typed.
+        # Join with a bounded timeout so a hung ASR can't stall the loop
+        # forever, but a normal utterance finishes well within the window.
         if _active_xcribe_threads:
-            _echo(f"Waiting for {_active_xcribe_threads.__len__()} pending transcription(s)...")
-            _deadline = time.monotonic() + 15.0  # max 15 s wait
-            for t in _active_xcribe_threads:
-                remaining = max(0.1, _deadline - time.monotonic())
-                t.join(timeout=remaining)
-            _active_xcribe_threads.clear()
+            _echo(f"{len(_active_xcribe_threads)} transcription(s) running in background — waiting to finish")
+            for _t in _active_xcribe_threads:
+                _t.join(timeout=180)
+        _active_xcribe_threads.clear()
 
         # Recording session ended — wait for next start or exit
+        logger.info("Session ended: clearing _stop_event and _start_event")
         _stop_event.clear()
         _start_event.clear()
         _json_emit(config, {"type": "state", "state": "idle"})
         if hooks and hooks.on_state:
             hooks.on_state("idle")
         _echo("Recording stopped. Waiting for start_recording...")
+
+        # Free the ASR model after a short grace period of idleness so it
+        # doesn't pin several GB of RAM/VRAM for the whole app lifetime.
+        _schedule_idle_release()
 
     # --- Cleanup: close stream and print telemetry ---
     if stream_iter is not None:
@@ -929,7 +1154,7 @@ def run_ws_audio(
                 )
                 if event is None or event.kind == "start":
                     if event:
-                        _debug(config, f"speech start at {event.start_sample/sr:.2f}s")
+                        logger.info(f"VAD: speech START at {event.start_sample/sr:.2f}s")
                     continue
                 if event.end_sample is None:
                     continue
@@ -1025,8 +1250,10 @@ def _transcribe_and_print(
 
     ts_total = time.monotonic()
 
-    # Drop overlap instead of queueing many decode jobs (keeps tail latency low).
-    if not _asr_semaphore.acquire(blocking=False):
+    # Acquire the ASR semaphore (warmup holds it while loading the model).
+    # Use a blocking acquire with timeout so we wait for warmup instead of
+    # silently dropping the utterance.
+    if not _asr_semaphore.acquire(blocking=True, timeout=120):
         _json_emit(
             config,
             {
@@ -1171,18 +1398,23 @@ def _transcribe_and_print(
     if hooks and hooks.on_state:
         hooks.on_state("rewriting")
 
-    # Build few-shot context from past corrected transcripts (latency-gated)
+    # Build few-shot context from past corrected transcripts (latency-gated).
+    # Only when embeddings are explicitly enabled (STT_EMBEDDINGS=1) — otherwise
+    # _build_few_shot_ctx's availability probe would lazily import and pin the
+    # sentence-transformers model (~hundreds of MB) into RAM on every utterance.
     few_shot_context = ""
     dict_llm_context = ""
+    _embeddings_enabled = os.environ.get("STT_EMBEDDINGS", "0") == "1"
     try:
         store = get_store()
-        candidates = store.recent_cleanups(limit=20)
-        if candidates:
-            before_ctx = time.monotonic()
-            few_shot_context = _build_few_shot_ctx(raw, candidates, top_k=3, max_tokens=400)
-            ctx_ms = (time.monotonic() - before_ctx) * 1000
-            if few_shot_context:
-                _debug(config, f"few-shot: {ctx_ms:.0f}ms embedding latency")
+        if _embeddings_enabled:
+            candidates = store.recent_cleanups(limit=20)
+            if candidates:
+                before_ctx = time.monotonic()
+                few_shot_context = _build_few_shot_ctx(raw, candidates, top_k=3, max_tokens=400)
+                ctx_ms = (time.monotonic() - before_ctx) * 1000
+                if few_shot_context:
+                    _debug(config, f"few-shot: {ctx_ms:.0f}ms embedding latency")
         # Build dictionary context for LLM (Layer 3)
         dict_llm_context = store.build_dict_llm_context()
         if dict_llm_context:
@@ -1197,8 +1429,15 @@ def _transcribe_and_print(
             for token in rewrite_stream(raw, config.llm, few_shot_context=few_shot_context, dictionary_context=dict_llm_context):
                 if token:
                     collected.append(token)
-                    sys.stdout.write(token)
-                    sys.stdout.flush()
+                    # In json_mode (Tauri/browser sidecar), stdout is the
+                    # line-delimited JSON event channel. Writing raw tokens
+                    # here corrupts that channel (breaks JSON.parse on the
+                    # client, drops the `processed` event, prevents typing)
+                    # and can emit non-UTF-8 bytes. Raw token echo is only
+                    # for interactive terminal mode.
+                    if not config.json_mode:
+                        sys.stdout.write(token)
+                        sys.stdout.flush()
                     # Stream partial LLM result to browser in real-time
                     _json_emit(config, {"type": "llm_partial", "text": "".join(collected), "utterance_id": utterance_id})
         processed = _clean_response("".join(collected))
@@ -1252,6 +1491,7 @@ def _transcribe_with_partials(
     )
     from stt.types import TranscriptionResult, TranscriptionSegment
     from stt.config import TranscriptionBackend
+    import time as _time
 
     audio = preprocess_audio(audio, sr, tcfg)
     if audio is None:
@@ -1265,6 +1505,7 @@ def _transcribe_with_partials(
         import os
         import sys as _sys
         import tempfile as _tempfile
+        import time as _time
 
         audio_path = None
         try:
@@ -1291,11 +1532,18 @@ def _transcribe_with_partials(
                 result = run_worker(worker_cfg)
             else:
                 import subprocess as _subprocess
-                proc = _subprocess.run(
-                    [_sys.executable, "-u", "-m", "stt._cpp_worker"],
-                    input=_json.dumps(worker_cfg),
-                    capture_output=True,
-                    text=True,
+                # Redirect the child's stderr to DEVNULL instead of
+                # capture_output=True: whisper.cpp is verbose and
+                # capture_output buffers the entire child stream in the
+                # parent's RAM until the process exits, spiking memory for
+                # long utterances. We only need the JSON on stdout.
+                with open(os.devnull, "w") as _devnull:
+                    proc = _subprocess.run(
+                        [_sys.executable, "-u", "-m", "stt._cpp_worker"],
+                        input=_json.dumps(worker_cfg),
+                        stdout=_subprocess.PIPE,
+                        stderr=_devnull,
+                        text=True,
                     timeout=120,
                 )
 

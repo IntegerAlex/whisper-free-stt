@@ -21,6 +21,8 @@ Thumbs.db
 venv/
 # Virtual environment
 .vscode/
+# Generated Windows build environment duplicate (1.8GB venv copy)
+stt-win11/
 # Ignore all node_modules folders everywhere in the project
 node_modules/
 **/node_modules/

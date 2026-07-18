@@ -1416,8 +1416,6 @@ pub fn run() {
             export_dictionary_csv,
             get_foreground_hwnd,
             set_foreground_hwnd,
-            commands::begin_capture,
-            commands::end_capture,
             commands::insert_text,
             commands::show_overlay,
             commands::hide_overlay,

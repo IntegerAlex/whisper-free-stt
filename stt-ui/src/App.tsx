@@ -790,6 +790,11 @@ function App() {
   const pttHwndRef = useRef<number | null>(null);  // Target HWND captured on PTT press
   const pttTextRef = useRef<string>("");            // Latest transcription text for PTT commit
   const pttIdleResolveRef = useRef<(() => void) | null>(null); // Resolver for idle state after stop
+  const overlayCleaningRef = useRef(false);                    // True while awaiting overlay cleanup
+  const overlayIdleResolveRef = useRef<(() => void) | null>(null); // Resolver for overlay:idle_ready
+  const hideOverlayTimeoutRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const sessionIdRef = useRef(0);                              // Monotonic session counter for cleanup safety
+  const stopTimestampRef = useRef(0);                          // Timestamp when stop() was called (for timeout diagnostics)
   const [view, setView] = useState<AppView>(
     localStorage.getItem("onboarding_completed") === "true" ? "main" : "onboarding"
   );
@@ -805,15 +810,12 @@ function App() {
   const nextLocalId = useRef(1);
   const sessionCounter = useRef(0);
   const feedRef = useRef<HTMLDivElement | null>(null);
-  const connectedRef = useRef(connected);
-  const isCommittingRef = useRef(false);
   const startRef = useRef<(overrideSettings?: RuntimeSettings, source?: string) => void>(() => {});
   const stopRef = useRef<(source?: string, commit?: boolean) => void>(() => {});
   const [settingsVersion, setSettingsVersion] = useState(0);
   const [hotkey, setHotkey] = useState(() => localStorage.getItem("stt-hotkey") || "CommandOrControl+Shift+Space");
 
 
-  connectedRef.current = connected;
   const { permissions, requestClipboard, requestMic, isCapturingMic, stopMic } = usePermissions();
 
   useEffect(() => {
@@ -823,33 +825,69 @@ function App() {
   }, []);
 
   // --- Engine lifecycle: spawn once on mount, keep alive permanently ---
-  useEffect(() => {
-    // StrictMode guard: prevent double-spawn in development
-    if (runtimeRef.current) return;
+  // spawnedRef tracks the LATEST api instance created by this effect.  In
+  // React StrictMode the effect fires twice (mount → cleanup → mount).
+  // The old code's guard (`if (runtimeRef.current) return`) failed because
+  // cleanup runs BEFORE the first spawn resolves, so `child` is null and
+  // `api.kill()` is a no-op — leaving two sidecar processes alive.
+  //
+  // Fix: track the latest API in spawnedRef.  When a spawn resolves, check
+  // whether it is still the latest; if not, kill it immediately.  Cleanup
+  // only kills the API if it is the current one (preventing a stale cleanup
+  // from killing a newer API).
+  const spawnedRef = useRef<STTApi | null>(null);
 
+  useEffect(() => {
     const api: STTApi = mode === "ws"
       ? createWebAudioApi(settings.wsPort)
       : createTauriApi(buildCliArgs(settings));
 
+    // Register event listener before spawn so we never miss early events
     api.onEvent(applyEvent);
+
+    // Mark this as the latest API — any older API that resolves later is stale
+    spawnedRef.current = api;
 
     // Spawn backend — loads models, warms ASR, stays idle until PTT
     // NOTE: runtimeRef is set ONLY after spawn resolves, so start() won't
     // fire before the sidecar's stdin pipe is ready.
     api.spawn().then(() => {
+      // If a newer API was created (StrictMode re-run or settings change),
+      // kill this stale instance immediately.
+      if (spawnedRef.current !== api) {
+        console.warn("[Engine] Stale sidecar killed — newer instance active");
+        api.kill();
+        return;
+      }
+      // Kill any previously-active sidecar (shouldn't happen with this
+      // guard, but defensive)
+      if (runtimeRef.current && runtimeRef.current !== api) {
+        runtimeRef.current.kill();
+      }
       runtimeRef.current = api;
       console.log("[Engine] Backend ready — waiting for PTT hotkey");
     }).catch((err) => {
       const msg = err instanceof Error ? err.message : "Failed to start engine";
       setToast(msg);
       addError("connection", msg, true, "Check if stt-engine is installed");
-      runtimeRef.current = null;
+      if (spawnedRef.current === api) {
+        runtimeRef.current = null;
+      }
     });
 
-    // Cleanup: kill backend on app unmount
+    // Cleanup: kill backend on app unmount or when deps change
     return () => {
-      api.kill();
-      runtimeRef.current = null;
+      // Clear spawnedRef if this is still the latest API
+      if (spawnedRef.current === api) {
+        spawnedRef.current = null;
+      }
+      // Kill only if this API is the active one
+      if (runtimeRef.current === api) {
+        api.kill();
+        runtimeRef.current = null;
+      }
+      // If runtimeRef points to a DIFFERENT (older) API, leave it alone —
+      // its own spawn handler or cleanup will deal with it.
     };
   }, [mode, settingsVersion]); // Re-spawn when mode changes OR settings saved
 
@@ -995,9 +1033,11 @@ function App() {
 
   const applyEvent = (event: STTEvent) => {
     if (event.type === "state") {
+      console.log(`[PTT] Backend state event: ${event.state} (resolver=${pttIdleResolveRef.current !== null})`);
       setStatus(event.state);
       // Resolve idle promise if waiting for PTT commit
       if (event.state === "idle" && pttIdleResolveRef.current) {
+        console.log("[PTT] Resolving idle promise from backend event");
         pttIdleResolveRef.current();
         pttIdleResolveRef.current = null;
       }
@@ -1008,8 +1048,8 @@ function App() {
       // Forward mic level to widget
       (async () => {
         try {
-          const { emit } = await import("@tauri-apps/api/event");
-          await emit("widget-mic-level", event.level);
+          const { emitTo } = await import("@tauri-apps/api/event");
+          await emitTo("widget", "widget-mic-level", event.level);
         } catch { /* not in Tauri */ }
       })();
       return;
@@ -1087,14 +1127,29 @@ function App() {
       return;
     }
 
+    // Cancel any pending cleanup from a previous session
+    if (hideOverlayTimeoutRef.current) {
+      clearTimeout(hideOverlayTimeoutRef.current);
+      hideOverlayTimeoutRef.current = null;
+    }
+    if (overlayIdleResolveRef.current) {
+      overlayIdleResolveRef.current = null;
+    }
+    overlayCleaningRef.current = false;
+
+    // New session — increment counter so old cleanup timeouts are invalidated
+    sessionIdRef.current++;
+    const sessionId = sessionIdRef.current;
+    console.log(`[PTT] Start — source=${source} — session=${sessionId}`);
+
     // Idle → Listening
     setPtt("listening");
-    console.log(`[PTT] Start — source=${source}`);
 
     // Tell overlay to show in listening mode
     try {
-      const { emit } = await import("@tauri-apps/api/event");
-      await emit("overlay:command", "listening" as const);
+      const { emitTo } = await import("@tauri-apps/api/event");
+      await emitTo("overlay", "overlay:command", "listening" as const);
+      console.log("[Overlay] Command: listening");
     } catch { /* not in Tauri */ }
 
     // Capture foreground window
@@ -1116,6 +1171,7 @@ function App() {
     try {
       const { invoke } = await import("@tauri-apps/api/core");
       await invoke("show_overlay");
+      console.log("[Overlay] Shown");
     } catch { /* not in Tauri */ }
 
     // Tell backend to begin capturing
@@ -1129,38 +1185,108 @@ function App() {
     if (pttStateRef.current !== "listening") return;
     if (!runtimeRef.current) return;
 
+    // Capture session ID — used to invalidate old cleanup timeouts
+    const sessionId = sessionIdRef.current;
+
     // Listening → Processing
     setPtt("processing");
-    console.log(`[PTT] Stop — source=${source}`);
+    console.log(`[PTT] Stop — source=${source} — session=${sessionId}`);
     playStopBeep();
 
     // Tell overlay to show processing state
     try {
-      const { emit } = await import("@tauri-apps/api/event");
-      await emit("overlay:command", "processing" as const);
+      const { emitTo } = await import("@tauri-apps/api/event");
+      await emitTo("overlay", "overlay:command", "processing" as const);
     } catch { /* not in Tauri */ }
+
+    if (!commit) {
+      // No commit — stop backend and clean up overlay
+      console.log("[PTT] No commit — cleaning up overlay");
+      runtimeRef.current.stop();
+      setConnected(false);
+      micLevelEmitter.emit(0);
+
+      // Verify session is still active before cleaning up
+      if (sessionIdRef.current !== sessionId) {
+        console.log(`[PTT] No-commit cleanup aborted — session ${sessionId} superseded by ${sessionIdRef.current}`);
+        return;
+      }
+
+      // Tell overlay to clean up, wait for acknowledgement, then hide
+      overlayCleaningRef.current = true;
+      try {
+        const { emitTo } = await import("@tauri-apps/api/event");
+        await emitTo("overlay", "overlay:command", "idle" as const);
+      } catch { /* not in Tauri */ }
+      await new Promise<void>((resolve) => {
+        overlayIdleResolveRef.current = resolve;
+        hideOverlayTimeoutRef.current = setTimeout(() => {
+          console.warn("[Overlay] idle_ready timeout — hiding anyway");
+          resolve();
+        }, 2000);
+      });
+      overlayIdleResolveRef.current = null;
+      if (hideOverlayTimeoutRef.current) {
+        clearTimeout(hideOverlayTimeoutRef.current);
+        hideOverlayTimeoutRef.current = null;
+      }
+
+      // Final session check before hiding
+      if (sessionIdRef.current !== sessionId) {
+        console.log(`[PTT] No-commit hide aborted — session ${sessionId} superseded`);
+        overlayCleaningRef.current = false;
+        return;
+      }
+
+      try {
+        const { invoke } = await import("@tauri-apps/api/core");
+        await invoke("hide_overlay");
+        console.log("[Overlay] Hidden");
+      } catch { /* not in Tauri */ }
+      setPtt("idle");
+      setStatus("idle");
+      overlayCleaningRef.current = false;
+      return;
+    }
+
+    // IMPORTANT: Set up idle resolver BEFORE sending stop_recording to backend.
+    // This closes the race window where backend emits "state: idle" before we're
+    // ready to listen for it.
+    //
+    // The backend waits up to 15s for transcription threads (orchestrator.py:790).
+    // This timeout must exceed that deadline. If it fires first, the frontend
+    // reads stale text before transcription completes.
+    // Backend emits idle immediately after recording loop ends (no thread join).
+    // Transcription runs in background and emits events through the pipeline.
+    const IDLE_TIMEOUT_MS = 20000;
+    stopTimestampRef.current = Date.now();
+    let idleTimeout: ReturnType<typeof setTimeout> | null = null;
+    const idlePromise = new Promise<void>((resolve) => {
+      pttIdleResolveRef.current = resolve;
+      console.log(`[PTT] Idle resolver set — session=${sessionId}`);
+      idleTimeout = setTimeout(() => {
+        const elapsed = Date.now() - stopTimestampRef.current;
+        console.error("[PTT] Idle timeout triggered");
+        console.error(`[PTT]   Session: ${sessionId}`);
+        console.error(`[PTT]   Backend state: ${status}`);
+        console.error(`[PTT]   Frontend state: ${pttStateRef.current}`);
+        console.error(`[PTT]   Elapsed: ${elapsed}ms (timeout: ${IDLE_TIMEOUT_MS}ms)`);
+        console.error(`[PTT]   Backend alive: ${runtimeRef.current !== null}`);
+        console.error(`[PTT]   Resolver still set: ${pttIdleResolveRef.current !== null}`);
+        resolve();
+      }, IDLE_TIMEOUT_MS);
+    });
 
     // Tell backend to stop capturing
     runtimeRef.current.stop();
     setConnected(false);
     micLevelEmitter.emit(0);
 
-    if (!commit) {
-      // No commit — go straight to Idle
-      setPtt("idle");
-      setStatus("idle");
-      try {
-        const { invoke } = await import("@tauri-apps/api/core");
-        await invoke("hide_overlay");
-      } catch { /* not in Tauri */ }
-      return;
-    }
-
-    // Wait for backend to finish all transcriptions (state → idle)
-    await new Promise<void>((resolve) => {
-      pttIdleResolveRef.current = resolve;
-      setTimeout(() => { resolve(); }, 10000);
-    });
+    // Now wait for backend to finish all transcriptions (state → idle)
+    await idlePromise;
+    if (idleTimeout) clearTimeout(idleTimeout);
+    const resolvedByEvent = pttIdleResolveRef.current === null;
+    console.log(`[PTT] Idle promise resolved (byEvent=${resolvedByEvent}) — session=${sessionId}`);
     pttIdleResolveRef.current = null;
 
     // Read accumulated text
@@ -1170,10 +1296,11 @@ function App() {
     if (text && hwnd) {
       // Processing → Inserting
       setPtt("inserting");
+      console.log("[PTT] Inserting text");
       // Tell overlay to show inserting state
       try {
-        const { emit } = await import("@tauri-apps/api/event");
-        await emit("overlay:command", "inserting" as const);
+        const { emitTo } = await import("@tauri-apps/api/event");
+        await emitTo("overlay", "overlay:command", "inserting" as const);
       } catch { /* not in Tauri */ }
       try {
         const { invoke } = await import("@tauri-apps/api/core");
@@ -1191,26 +1318,66 @@ function App() {
     // Inserting → Success (brief confirmation)
     setPtt("success");
     setStatus("idle");
+    console.log("[PTT] Success — showing confirmation");
 
     // Tell overlay to show success state
     try {
-      const { emit } = await import("@tauri-apps/api/event");
-      await emit("overlay:command", "success" as const);
+      const { emitTo } = await import("@tauri-apps/api/event");
+      await emitTo("overlay", "overlay:command", "success" as const);
     } catch { /* not in Tauri */ }
 
-    // Success → Idle after 400ms
-    setTimeout(() => {
+    // After 400ms: clean up overlay, then transition to idle
+    // NOTE: setPtt("idle") is called AFTER cleanup, not before.
+    // This prevents a new session from starting while old cleanup is running.
+    setTimeout(async () => {
+      console.log("[PTT] Success timeout — cleaning up overlay");
+
+      // Verify session is still active before cleaning up
+      if (sessionIdRef.current !== sessionId) {
+        console.log(`[PTT] Cleanup aborted — session ${sessionId} superseded by ${sessionIdRef.current}`);
+        return;
+      }
+
+      // Tell overlay to clean up, wait for acknowledgement, then hide
+      overlayCleaningRef.current = true;
+      try {
+        const { emitTo } = await import("@tauri-apps/api/event");
+        await emitTo("overlay", "overlay:command", "idle" as const);
+      } catch { /* not in Tauri */ }
+      await new Promise<void>((resolve) => {
+        overlayIdleResolveRef.current = resolve;
+        hideOverlayTimeoutRef.current = setTimeout(() => {
+          console.warn("[Overlay] idle_ready timeout — hiding anyway");
+          resolve();
+        }, 2000);
+      });
+      overlayIdleResolveRef.current = null;
+      if (hideOverlayTimeoutRef.current) {
+        clearTimeout(hideOverlayTimeoutRef.current);
+        hideOverlayTimeoutRef.current = null;
+      }
+
+      // Final session check before hiding
+      if (sessionIdRef.current !== sessionId) {
+        console.log(`[PTT] Hide aborted — session ${sessionId} superseded`);
+        overlayCleaningRef.current = false;
+        return;
+      }
+
+      try {
+        const { invoke } = await import("@tauri-apps/api/core");
+        await invoke("hide_overlay");
+        console.log("[Overlay] Hidden — session finished");
+      } catch { /* not in Tauri */ }
+
+      // NOW transition to idle — new sessions can start after this
       setPtt("idle");
-      // Hide overlay
-      import("@tauri-apps/api/core").then(({ invoke }) => {
-        invoke("hide_overlay");
-      }).catch(() => {});
+      overlayCleaningRef.current = false;
     }, 400);
 
-    // Clean up
+    // Clean up refs (async — happens while overlay is showing success)
     pttTextRef.current = "";
     pttHwndRef.current = null;
-    isCommittingRef.current = false;
   };
 
   startRef.current = start;
@@ -1220,11 +1387,29 @@ function App() {
   useEffect(() => {
     (async () => {
       try {
-        const { emit } = await import("@tauri-apps/api/event");
-        await emit("widget-status", status);
+        const { emitTo } = await import("@tauri-apps/api/event");
+        await emitTo("widget", "widget-status", status);
       } catch { /* not in Tauri */ }
     })();
   }, [status]);
+
+  // --- Overlay: listen for cleanup acknowledgement ---
+  useEffect(() => {
+    let unlisten: (() => void) | undefined;
+    (async () => {
+      try {
+        const { listen } = await import("@tauri-apps/api/event");
+        unlisten = await listen("overlay:idle_ready", () => {
+          console.log("[Overlay] Received idle_ready — cleanup complete");
+          if (overlayIdleResolveRef.current) {
+            overlayIdleResolveRef.current();
+            overlayIdleResolveRef.current = null;
+          }
+        });
+      } catch { /* not in Tauri */ }
+    })();
+    return () => { unlisten?.(); };
+  }, []);
 
   // --- Widget: listen for toggle and show-main events ---
   useEffect(() => {
