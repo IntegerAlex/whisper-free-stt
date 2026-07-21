@@ -788,7 +788,7 @@ function App() {
   const [highlightPermissions, setHighlightPermissions] = useState(false);
   const [resolvedModel, setResolvedModel] = useState<{ profile: string; model: string; backend: string; device: string } | null>(null);
   const pttHwndRef = useRef<number | null>(null);  // Target HWND captured on PTT press
-  const pttTextRef = useRef<string>("");            // Latest transcription text for PTT commit
+  const pttPartsRef = useRef<Map<number, string>>(new Map());  // utterance_id → text for PTT commit
   const pttIdleResolveRef = useRef<(() => void) | null>(null); // Resolver for idle state after stop
   const overlayCleaningRef = useRef(false);                    // True while awaiting overlay cleanup
   const overlayIdleResolveRef = useRef<(() => void) | null>(null); // Resolver for overlay:idle_ready
@@ -1080,25 +1080,30 @@ function App() {
         ...prev,
         { id, raw: event.text, processed: "", status: "transcribing", createdAt: new Date().toISOString() },
       ].slice(-500));
-      // Store the latest text for PTT commit
-      pttTextRef.current = event.text;
+      // Store this utterance's text for PTT commit (accumulates across utterances)
+      pttPartsRef.current.set(event.utterance_id ?? rawId, event.text);
       return;
     }
     if (event.type === "processed") {
-      const id = event.utterance_id;
-      if (!id) return;
+      const utteranceId = event.utterance_id;
+      if (!utteranceId) return;
+      // Match the line id scheme from the raw handler: sessionCounter * 100000 + utterance_id
+      const lineId = sessionCounter.current * 100000 + utteranceId;
       setLines((prev) => prev.map((line) =>
-        line.id === id ? { ...line, processed: event.text, status: "done" } : line
+        line.id === lineId ? { ...line, processed: event.text, status: "done" } : line
       ));
-      pttTextRef.current = event.text;
+      // Accumulate this utterance's final text for PTT commit
+      pttPartsRef.current.set(utteranceId, event.text);
     }
     if (event.type === "llm_partial") {
-      const id = event.utterance_id;
-      if (!id) return;
+      const utteranceId = event.utterance_id;
+      if (!utteranceId) return;
+      const lineId = sessionCounter.current * 100000 + utteranceId;
       setLines((prev) => prev.map((line) =>
-        line.id === id ? { ...line, processed: event.text, status: "rewriting" } : line
+        line.id === lineId ? { ...line, processed: event.text, status: "rewriting" } : line
       ));
-      pttTextRef.current = event.text;
+      // Update this utterance's text (partial, will be overwritten by processed)
+      pttPartsRef.current.set(utteranceId, event.text);
     }
   };
 
@@ -1161,7 +1166,7 @@ function App() {
       pttHwndRef.current = null;
     }
 
-    pttTextRef.current = "";
+    pttPartsRef.current.clear();
     sessionCounter.current++;
     nextLocalId.current = 1;
     setLines([]);
@@ -1289,8 +1294,8 @@ function App() {
     console.log(`[PTT] Idle promise resolved (byEvent=${resolvedByEvent}) — session=${sessionId}`);
     pttIdleResolveRef.current = null;
 
-    // Read accumulated text
-    const text = pttTextRef.current.trim();
+    // Join all utterances' text in order for the PTT commit
+    const text = Array.from(pttPartsRef.current.values()).join(" ").trim();
     const hwnd = pttHwndRef.current;
 
     if (text && hwnd) {
@@ -1376,7 +1381,7 @@ function App() {
     }, 400);
 
     // Clean up refs (async — happens while overlay is showing success)
-    pttTextRef.current = "";
+    pttPartsRef.current.clear();
     pttHwndRef.current = null;
   };
 
