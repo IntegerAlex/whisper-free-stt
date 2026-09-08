@@ -177,8 +177,8 @@ function SnippetModal({
 
   return (
     <div className="fixed inset-0 z-50 flex items-center justify-center">
-      <div className="absolute inset-0 bg-[rgba(44,37,32,0.4)] backdrop-blur-sm" onClick={onClose} />
-      <div className="relative w-full max-w-[520px] mx-4 rounded-[20px] bg-app-surface-dark border border-border-hover shadow-2xl max-h-[85vh] overflow-y-auto">
+      <div className="absolute inset-0 bg-[rgba(44,37,32,0.4)]" onClick={onClose} />
+      <div className="relative w-full max-w-[520px] mx-4 rounded-xl bg-app-surface-dark border border-border-hover shadow-lg max-h-[85vh] overflow-y-auto">
         <div className="px-6 pt-6 pb-4">
           <h3 className="text-text-primary text-[16px] font-semibold">
             {snippet ? "Edit Snippet" : "Add Snippet"}
@@ -299,8 +299,8 @@ function DeleteConfirm({
 }) {
   return (
     <div className="fixed inset-0 z-50 flex items-center justify-center">
-      <div className="absolute inset-0 bg-[rgba(44,37,32,0.4)] backdrop-blur-sm" onClick={onCancel} />
-      <div className="relative w-full max-w-[380px] mx-4 rounded-[20px] bg-app-surface-dark border border-border-hover shadow-2xl p-6">
+      <div className="absolute inset-0 bg-[rgba(44,37,32,0.4)]" onClick={onCancel} />
+      <div className="relative w-full max-w-[380px] mx-4 rounded-xl bg-app-surface-dark border border-border-hover shadow-lg p-6">
         <h3 className="text-text-primary text-[16px] font-semibold">Delete Snippet</h3>
         <p className="text-text-muted text-[14px] mt-2">
           Are you sure you want to delete{" "}

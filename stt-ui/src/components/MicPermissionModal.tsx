@@ -24,7 +24,7 @@ export default function MicPermissionModal({ visible, onOpenConfig, onClose }: M
 
   return (
     <div
-      className="fixed inset-0 z-50 flex items-center justify-center bg-[rgba(44,37,32,0.4)] backdrop-blur-sm"
+      className="fixed inset-0 z-50 flex items-center justify-center bg-[rgba(44,37,32,0.4)]"
       onClick={(e) => { if (e.target === e.currentTarget) onClose(); }}
       role="dialog"
       aria-modal="true"

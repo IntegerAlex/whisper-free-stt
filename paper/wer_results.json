@@ -1,0 +1,12 @@
+{
+  "balanced": {
+    "model": "base.en",
+    "backend": "WHISPER_CPP",
+    "n": 50,
+    "wer_pct": 16.0,
+    "p50": 1.904,
+    "p95": 2.327,
+    "mean": 1.954,
+    "std": 0.274
+  }
+}

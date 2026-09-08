@@ -1,7 +1,17 @@
+mod audio;
+mod config;
+mod llm;
+mod models;
+mod output;
+mod parakeet;
+mod pipeline;
+mod vad;
+mod whisper;
 mod widget;
 #[cfg(test)]
 mod tests;
 
+use crate::config::AppConfig;
 use rusqlite::Connection;
 use serde::Serialize;
 use tauri::{Emitter, Manager};
@@ -851,65 +861,87 @@ async fn export_dictionary_csv() -> Result<serde_json::Value, AppError> {
 #[derive(Debug, Serialize)]
 struct ModelStatus {
     name: String,
+    id: String,
     downloaded: bool,
     path: String,
     size_bytes: u64,
+    url: String,
+    backend: String,
+    recommended: bool,
 }
 
 #[tauri::command]
 fn check_model_status() -> Result<Vec<ModelStatus>, AppError> {
-    let home = dirs_next::home_dir().ok_or_else(|| {
-        AppError::Io(std::io::Error::other("Could not determine home directory"))
-    })?;
-
+    let config = AppConfig::load();
     let mut statuses = Vec::new();
 
-    // whisper.cpp models: ~/.local/share/pywhispercpp/models/ggml-{name}.bin
-    let cpp_dir = home.join(".local/share/pywhispercpp/models");
-    for name in &["tiny.en", "base.en", "small.en"] {
-        let path = cpp_dir.join(format!("ggml-{}.bin", name));
-        let (downloaded, size_bytes) = if path.exists() {
-            let meta = std::fs::metadata(&path).map(|m| m.len()).unwrap_or(0);
-            (true, meta)
-        } else {
-            (false, 0)
-        };
-        statuses.push(ModelStatus {
-            name: name.to_string(),
-            downloaded,
-            path: path.to_string_lossy().to_string(),
-            size_bytes,
-        });
-    }
-
-    // faster-whisper models: ~/.cache/huggingface/hub/models--{org}--{repo}/
-    let hf_dir = home.join(".cache/huggingface/hub");
-    let fw_models: Vec<(&str, &str, &str)> = vec![
-        ("tiny.en", "Systran", "faster-whisper-tiny"),
-        ("base.en", "Systran", "faster-whisper-base"),
-        ("small.en", "Systran", "faster-whisper-small"),
-        ("distil-large-v3", "Systran", "faster-distil-whisper-large-v3"),
-        ("large-v3-turbo", "mobiuslabsgmbh", "faster-whisper-large-v3-turbo"),
-    ];
-
-    for (name, org, repo) in &fw_models {
-        let model_dir = hf_dir.join(format!("models--{}--{}", org, repo));
-        let (downloaded, size_bytes) = if model_dir.exists() {
-            // Walk the directory to sum file sizes
+    for model in models::MODEL_MANIFEST {
+        let model_dir = config.model_dir.join(model.id);
+        let downloaded = models::verify_model(&config.model_dir, model);
+        let (downloaded_flag, size_bytes) = if model_dir.exists() {
             let total = walk_dir_size(&model_dir).unwrap_or(0);
-            (total > 0, total)
+            (true, total)
         } else {
             (false, 0)
         };
         statuses.push(ModelStatus {
-            name: name.to_string(),
-            downloaded,
+            name: model.name.to_string(),
+            id: model.id.to_string(),
+            downloaded: downloaded || downloaded_flag,
             path: model_dir.to_string_lossy().to_string(),
             size_bytes,
+            url: model.url.to_string(),
+            backend: model.backend.to_string(),
+            recommended: model.recommended,
         });
     }
 
     Ok(statuses)
+}
+
+#[tauri::command]
+async fn download_model(id: String) -> Result<(), AppError> {
+    let config = AppConfig::load();
+    let model = models::find_model(&id)
+        .ok_or_else(|| AppError::Io(std::io::Error::other(format!("Model not found: {}", id))))?;
+
+    tauri::async_runtime::spawn(async move {
+        let _ = models::download_model(
+            model,
+            &config.model_dir,
+            |_percent, _bytes| {},
+        ).await;
+    });
+
+    Ok(())
+}
+
+#[tauri::command]
+async fn get_available_mics() -> Result<Vec<(String, String)>, String> {
+    crate::audio::list_input_devices()
+        .map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+fn start_listening(app: tauri::AppHandle) -> Result<(), String> {
+    let config = AppConfig::load();
+    crate::pipeline::start_pipeline(app, config)
+        .map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+fn stop_listening() {
+    crate::pipeline::stop_pipeline();
+}
+
+#[tauri::command]
+async fn get_floure_config() -> Result<AppConfig, String> {
+    Ok(AppConfig::load())
+}
+
+#[tauri::command]
+async fn set_floure_config(config: AppConfig) -> Result<(), String> {
+    config.save().map_err(|e| e.to_string())
 }
 
 #[tauri::command]
@@ -1207,20 +1239,7 @@ fn type_text(text: String, restore_hwnd: Option<u64>) -> Result<bool, String> {
 
 #[tauri::command]
 fn get_backend_path() -> Result<String, AppError> {
-    let candidates = vec![
-        std::env::current_dir()
-            .unwrap_or_default()
-            .join("../stt/cli.py")
-            .to_string_lossy()
-            .to_string(),
-        "/usr/local/bin/stt".to_string(),
-    ];
-    for c in &candidates {
-        if std::path::Path::new(c).exists() {
-            return Ok(c.clone());
-        }
-    }
-    Ok("stt".to_string())
+    Ok("builtin".to_string())
 }
 
 #[tauri::command]
@@ -1407,6 +1426,7 @@ pub fn run() {
             get_platform_info,
             check_system_deps,
             check_model_status,
+            download_model,
             delete_model_file,
             get_history,
             get_insights,
@@ -1421,6 +1441,11 @@ pub fn run() {
             type_text,
             get_foreground_hwnd,
             set_foreground_hwnd,
+            get_available_mics,
+            get_floure_config,
+            set_floure_config,
+            start_listening,
+            stop_listening,
             widget::show_widget,
             widget::hide_widget,
             widget::get_widget_visible,

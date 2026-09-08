@@ -6,12 +6,13 @@
 
 export type STTEvent =
   | { type: "state"; state: string; utterance_id?: number }
-  | { type: "raw"; text: string; utterance_id?: number }
-  | { type: "processed"; text: string; utterance_id?: number }
-  | { type: "llm_partial"; text: string; utterance_id?: number }
+  | { type: "asr_ready"; backend: string }
+  | { type: "asr_partial"; text: string }
+  | { type: "asr_final"; text: string; latency_ms: number }
+  | { type: "llm_start" }
+  | { type: "llm_token"; text: string }
+  | { type: "llm_end"; text: string }
   | { type: "mic"; level: number }
-  | { type: "error"; message: string; utterance_id?: number }
-  | { type: "dropped"; reason: string; duration_sec?: number; utterance_id?: number }
   | { type: "info"; profile: string; model: string; backend: string; device: string };
 
 export interface STTApi {
@@ -23,7 +24,7 @@ export interface STTApi {
   start(): void;
   /** Send stop_recording command. Backend stops mic, finalizes transcript. */
   stop(): void;
-  /** Send an arbitrary command to the backend via stdin. */
+  /** Send an arbitrary command to the backend. */
   sendCommand(cmd: Record<string, unknown>): void;
   /** Subscribe to backend events. */
   onEvent(cb: (e: STTEvent) => void): void;

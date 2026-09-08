@@ -104,7 +104,7 @@ function StatusLabel({ status }: { status: WidgetStatus }) {
 
   return (
     <span className={`text-[11px] font-medium tracking-wide whitespace-nowrap transition-colors duration-300 ${
-      status === "error" ? "text-red-400/90" : "text-amber-200/80"
+      status === "error" ? "text-red-400/90" : "text-text-muted"
     }`}>
       {label}
     </span>
@@ -253,14 +253,9 @@ export default function WidgetView() {
           style={{ background: "linear-gradient(0deg, rgba(44,37,32,0.15) 0%, transparent 30%)" }}
         />
 
-        {/* Idle breathing glow */}
         {!expanded && (
           <div
             className="absolute inset-0 rounded-[14px] pointer-events-none"
-            style={{
-              background: "radial-gradient(circle at center, rgba(255,59,86,0.06) 0%, transparent 70%)",
-              animation: "widget-breathe 4s ease-in-out infinite",
-            }}
           />
         )}
 
@@ -354,7 +349,7 @@ export default function WidgetView() {
       {/* Coming soon tooltip */}
       {showComingSoon && (
         <div
-          className="absolute z-50 px-2.5 py-1 rounded-lg text-[11px] font-medium text-amber-200/90 whitespace-nowrap pointer-events-none"
+          className="absolute z-50 px-2.5 py-1 rounded-lg text-[11px] font-medium text-text-secondary whitespace-nowrap pointer-events-none"
           style={{
             top: -32,
             left: "50%",

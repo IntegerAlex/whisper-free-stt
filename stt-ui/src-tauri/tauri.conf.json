@@ -41,7 +41,7 @@
       "csp": "default-src 'self'; style-src 'self' 'unsafe-inline' https://fonts.googleapis.com; font-src 'self' https://fonts.gstatic.com; media-src 'self' blob: mediastream:; connect-src 'self' ipc: http://ipc.localhost; script-src 'self'"
     }
   },
-  "bundle": {
+    "bundle": {
     "active": true,
     "targets": "all",
     "icon": [
@@ -50,14 +50,13 @@
       "icons/128x128@2x.png",
       "icons/icon.icns",
       "icons/icon.ico"
-    ],
-    "externalBin": ["binaries/stt-engine"]
+    ]
   },
   "plugins": {
     "updater": {
       "pubkey": "dW50cnVzdGVkIGNvbW1lbnQ6IG1pbmlzaWduIHJlcXVpcmVk",
       "endpoints": [
-        "https://github.com/GuixJoy/whisper-free-stt/releases/latest/download/latest.json"
+        "https://github.com/IntegerAlex/floure-core/releases/latest/download/latest.json"
       ]
     }
   }

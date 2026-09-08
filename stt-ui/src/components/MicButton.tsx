@@ -20,7 +20,7 @@ export default function MicButton({ status, connected, onToggle }: MicButtonProp
       <button
         onClick={onToggle}
         className={cn(
-          "relative flex items-center justify-center rounded-full transition-all duration-300",
+          "relative flex items-center justify-center rounded-full transition-all duration-200",
           "w-[80px] h-[80px]",
           isError && [
             "bg-app-surface-secondary border-2 border-[#EF4444]",
@@ -50,7 +50,7 @@ export default function MicButton({ status, connected, onToggle }: MicButtonProp
       >
         <div
           className={cn(
-            "transition-all duration-300",
+            "transition-all duration-200",
             isActive || isError ? "text-white" : "text-text-muted",
           )}
         >

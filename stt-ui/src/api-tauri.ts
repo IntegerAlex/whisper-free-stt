@@ -1,133 +1,109 @@
-// ── Tauri sidecar: spawns `stt-engine` via shell plugin ──
+// ── Tauri native backend: uses Rust commands + Tauri events ──
 import { type STTApi, type STTEvent } from "./api";
-import type { Child } from "@tauri-apps/plugin-shell";
 
-let webAudioCapture: {
-  stream: MediaStream;
-  audioContext: AudioContext;
-  source: MediaStreamAudioSourceNode;
-  analyser: AnalyserNode;
-} | null = null;
-
-export async function requestWebAudioCapture(): Promise<boolean> {
-  try {
-    const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
-    const audioContext = new AudioContext();
-    const source = audioContext.createMediaStreamSource(stream);
-    const analyser = audioContext.createAnalyser();
-    analyser.fftSize = 256;
-    source.connect(analyser);
-    webAudioCapture = { stream, audioContext, source, analyser };
-    return true;
-  } catch (err) {
-    console.error("Failed to capture web audio", err);
-    return false;
-  }
-}
-
-export function stopWebAudioCapture(): void {
-  if (webAudioCapture) {
-    webAudioCapture.stream.getTracks().forEach((track) => track.stop());
-    webAudioCapture.audioContext.close();
-    webAudioCapture = null;
-  }
-}
-
-export function getWebAudioAnalyser(): AnalyserNode | null {
-  return webAudioCapture?.analyser ?? null;
-}
-
-export function createTauriApi(args: string[], sidecarName: string = "binaries/stt-engine"): STTApi {
+export function createTauriApi(): STTApi {
   let listeners: Array<(e: STTEvent) => void> = [];
-  let child: Child | null = null;
+  let unlistenFns: Array<() => void> = [];
 
-  // Line buffers: accumulate partial data until newline boundary
-  let stdoutBuf = "";
-  let stderrBuf = "";
-
-  const notifyError = (msg: string) => {
-    for (const cb of listeners) cb({ type: "error", message: msg });
+  const emit = (e: STTEvent) => {
+    for (const cb of listeners) cb(e);
   };
 
-  const emitLines = (source: string, buf: string): string => {
-    const nlIdx = buf.lastIndexOf("\n");
-    if (nlIdx < 0) return buf;
-    const complete = buf.slice(0, nlIdx + 1);
-    const remainder = buf.slice(nlIdx + 1);
-    const lines = complete.split("\n");
-    for (const raw of lines) {
-      const trimmed = raw.trim();
-      if (!trimmed) continue;
-      try {
-        const event: STTEvent = JSON.parse(trimmed);
-        for (const cb of listeners) cb(event);
-      } catch {
-        if (source === "stderr") {
-          console.warn(`[Sidecar stderr] ${trimmed}`);
-        } else {
-          console.log(`[Sidecar stdout] ${trimmed}`);
-        }
-      }
+  const handleEvent = (name: string, payload: any) => {
+    currentStatus = "listening";
+    switch (name) {
+      case "asr_ready":
+        emit({ type: "asr_ready", backend: payload.backend ?? "parakeet" });
+        emit({ type: "state", state: "idle" });
+        break;
+      case "asr_partial":
+        currentStatus = "transcribing";
+        emit({ type: "asr_partial", text: payload.text ?? "" });
+        break;
+      case "asr_final":
+        emit({ type: "asr_final", text: payload.text ?? "", latency_ms: payload.latency_ms ?? 0 });
+        break;
+      case "llm_start":
+        currentStatus = "rewriting";
+        emit({ type: "llm_start" });
+        emit({ type: "state", state: "rewriting" });
+        break;
+      case "llm_token":
+        emit({ type: "llm_token", text: payload.text ?? "" });
+        break;
+      case "llm_end":
+        emit({ type: "llm_end", text: payload.text ?? "" });
+        emit({ type: "state", state: "done" });
+        break;
+      default:
+        break;
     }
-    return remainder;
   };
 
   return {
-    onEvent(cb) { listeners.push(cb); },
+    onEvent(cb) {
+      listeners.push(cb);
+    },
 
     async spawn() {
-      const { Command } = await import("@tauri-apps/plugin-shell");
-      const cmd = Command.sidecar(sidecarName, args);
-      cmd.stdout.on("data", (chunk: string) => {
-        stdoutBuf += chunk;
-        stdoutBuf = emitLines("stdout", stdoutBuf);
-      });
-      cmd.stderr.on("data", (chunk: string) => {
-        stderrBuf += chunk;
-        stderrBuf = emitLines("stderr", stderrBuf);
-      });
-      cmd.on("close", () => {
-        // Flush any remaining buffered data
-        if (stdoutBuf.trim()) emitLines("stdout", stdoutBuf + "\n");
-        if (stderrBuf.trim()) emitLines("stderr", stderrBuf + "\n");
-        stdoutBuf = "";
-        stderrBuf = "";
-        for (const cb of listeners) cb({ type: "state", state: "idle" });
-      });
-      cmd.on("error", (err: string) => {
-        notifyError(`Sidecar error: ${err}`);
-      });
-      child = await cmd.spawn();
-      console.log("[Engine] Sidecar spawned — models loading, engine warming...");
+      const { listen } = await import("@tauri-apps/api/event");
+      const events = [
+        "asr_ready", "asr_partial", "asr_final",
+        "llm_start", "llm_token", "llm_end",
+      ];
+      for (const eventName of events) {
+        const unlisten = await listen(eventName, (event) => {
+          handleEvent(eventName, event.payload);
+        });
+        unlistenFns.push(unlisten);
+      }
+      emit({ type: "state", state: "idle" });
     },
 
     kill() {
+      unlistenFns.forEach((un) => un());
+      unlistenFns = [];
       listeners = [];
-      if (child) {
-        try { child.kill(); } catch { }
-        child = null;
-        console.log("[Engine] Sidecar killed");
-      }
     },
 
     start() {
-      this.sendCommand({ type: "start_recording" });
-      console.log("[PTT] Sent start_recording");
+      (async () => {
+        const { invoke } = await import("@tauri-apps/api/core");
+        try {
+          await invoke("start_listening");
+          currentText = "";
+          nextUtteranceId += 1;
+        } catch (e) {
+          emit({ type: "state", state: "error" });
+        }
+      })();
     },
 
     stop() {
-      this.sendCommand({ type: "stop_recording" });
-      console.log("[PTT] Sent stop_recording");
+      (async () => {
+        const { invoke } = await import("@tauri-apps/api/core");
+        try {
+          await invoke("stop_listening");
+          emit({ type: "state", state: "done" });
+        } catch (e) {
+          emit({ type: "state", state: "error" });
+        }
+      })();
     },
 
     sendCommand(cmd: Record<string, unknown>) {
-      if (child) {
+      (async () => {
+        const { invoke } = await import("@tauri-apps/api/core");
         try {
-          child.write(JSON.stringify(cmd) + "\n");
+          if (cmd.type === "start_recording") {
+            await invoke("start_listening");
+          } else if (cmd.type === "stop_recording") {
+            await invoke("stop_listening");
+          }
         } catch (e) {
-          console.warn("[Engine] Failed to write command:", e);
+          emit({ type: "state", state: "error" });
         }
-      }
+      })();
     },
   };
 }

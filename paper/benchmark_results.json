@@ -1,0 +1,28 @@
+{
+  "asr": {},
+  "dictionary": {
+    "total": 5,
+    "layer1_correct": 5,
+    "layer2_correct": 5,
+    "layer1_pct": 100.0,
+    "cumulative_pct": 100.0
+  },
+  "vad": {
+    "quiet": {
+      "noise_level": 0.003,
+      "speech_starts": 10,
+      "speech_ends": 10
+    },
+    "hvac": {
+      "noise_level": 0.01,
+      "speech_starts": 3,
+      "speech_ends": 2
+    },
+    "noisy": {
+      "noise_level": 0.025,
+      "speech_starts": 3,
+      "speech_ends": 2
+    }
+  },
+  "timestamp": "2026-07-18 12:41:19"
+}

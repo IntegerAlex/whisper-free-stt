@@ -79,7 +79,7 @@ function EntryCard({
             {entry.phrase}
           </span>
           {entry.auto_learned && (
-            <span className="text-[13px]" title="Auto-learned">✨</span>
+            <span className="text-[11px] text-text-muted font-medium px-1.5 py-0.5 rounded bg-app-surface-secondary" title="Auto-learned">auto</span>
           )}
           <span className="text-text-muted text-[15px]">→</span>
           <span className="text-text-secondary text-[15px] truncate">
@@ -155,8 +155,8 @@ function EntryModal({
 
   return (
     <div className="fixed inset-0 z-50 flex items-center justify-center">
-      <div className="absolute inset-0 bg-[rgba(44,37,32,0.4)] backdrop-blur-sm" onClick={onClose} />
-      <div className="relative w-full max-w-[440px] mx-4 rounded-[20px] bg-app-surface-dark border border-border-hover shadow-2xl">
+      <div className="absolute inset-0 bg-[rgba(44,37,32,0.4)]" onClick={onClose} />
+      <div className="relative w-full max-w-[440px] mx-4 rounded-xl bg-app-surface-dark border border-border-hover shadow-lg">
         <div className="px-6 pt-6 pb-4">
           <h3 className="text-text-primary text-[16px] font-semibold">
             {entry ? "Edit Word" : "Add Word"}
@@ -262,8 +262,8 @@ function DeleteConfirm({
 }) {
   return (
     <div className="fixed inset-0 z-50 flex items-center justify-center">
-      <div className="absolute inset-0 bg-[rgba(44,37,32,0.4)] backdrop-blur-sm" onClick={onCancel} />
-      <div className="relative w-full max-w-[380px] mx-4 rounded-[20px] bg-app-surface-dark border border-border-hover shadow-2xl p-6">
+      <div className="absolute inset-0 bg-[rgba(44,37,32,0.4)]" onClick={onCancel} />
+      <div className="relative w-full max-w-[380px] mx-4 rounded-xl bg-app-surface-dark border border-border-hover shadow-lg p-6">
         <h3 className="text-text-primary text-[16px] font-semibold">Delete Word</h3>
         <p className="text-text-muted text-[14px] mt-2">
           Are you sure you want to remove <span className="text-text-primary font-medium">"{phrase}"</span> from your dictionary? This cannot be undone.

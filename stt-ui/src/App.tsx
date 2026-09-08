@@ -30,11 +30,11 @@ import Waveform from "./components/Waveform";
 
 const SettingsSchema = z.object({
   wsPort: z.number().int().min(1).max(65535),
-  asrProfile: z.enum(["auto", "speed", "balanced", "accuracy", "distil", "turbo"]),
-  backend: z.enum(["auto", "whisper_cpp", "faster_whisper"]),
+  asrProfile: z.enum(["auto", "parakeet", "whisper-turbo", "whisper-base"]),
+  backend: z.enum(["sherpa_onnx"]),
   model: z.string().max(100),
-  llmMode: z.enum(["cleanup", "off", "bullet_list", "email", "commit_message"]),
-  llmProvider: z.enum(["deepseek", "openrouter"]),
+  llmMode: z.enum(["off", "cleanup", "bullet_list", "email", "commit_message"]),
+  llmProvider: z.enum(["local", "deepseek", "openrouter"]),
   llmModel: z.string().max(100),
   llmFallback: z.string().max(100),
   deepseekApiKey: z.string().max(200),
@@ -63,11 +63,11 @@ interface TranscriptLine {
 
 export interface RuntimeSettings {
   wsPort: number;
-  asrProfile: "auto" | "speed" | "balanced" | "accuracy" | "distil" | "turbo";
-  backend: "auto" | "whisper_cpp" | "faster_whisper";
+  asrProfile: "auto" | "parakeet" | "whisper-turbo" | "whisper-base";
+  backend: "sherpa_onnx";
   model: string;
   llmMode: "cleanup" | "off" | "bullet_list" | "email" | "commit_message";
-  llmProvider: "deepseek" | "openrouter";
+  llmProvider: "local" | "deepseek" | "openrouter";
   llmModel: string;
   llmFallback: string;
   deepseekApiKey: string;
@@ -82,11 +82,11 @@ export interface RuntimeSettings {
 
 const DEFAULT_SETTINGS: RuntimeSettings = {
   wsPort: 8765,
-  asrProfile: "auto",
-  backend: "auto",
+  asrProfile: "parakeet",
+  backend: "sherpa_onnx",
   model: "",
   llmMode: "cleanup",
-  llmProvider: "openrouter",
+  llmProvider: "local",
   llmModel: "",
   llmFallback: "",
   deepseekApiKey: "",
@@ -124,8 +124,8 @@ function getInitialSettings(): RuntimeSettings {
 }
 
 function buildCliArgs(settings: RuntimeSettings): string[] {
-  const args: string[] = ["--json-mode", "--asr-profile", settings.asrProfile, "--llm-mode", settings.llmMode];
-  if (settings.backend !== "auto") args.push("--backend", settings.backend);
+  const args: string[] = ["--asr-profile", settings.asrProfile, "--llm-mode", settings.llmMode];
+  if (settings.backend !== "sherpa_onnx") args.push("--backend", settings.backend);
   if (settings.model.trim()) args.push("--model", settings.model.trim());
   if (settings.llmProvider !== "openrouter") args.push("--llm-provider", settings.llmProvider);
   if (settings.llmModel.trim()) args.push("--llm-model", settings.llmModel.trim());
@@ -145,7 +145,6 @@ function buildWsCommand(settings: RuntimeSettings): string {
     "--asr-profile", settings.asrProfile,
     "--llm-mode", settings.llmMode,
   ];
-  if (settings.backend !== "auto") args.push("--backend", settings.backend);
   if (settings.model.trim()) args.push("--model", settings.model.trim());
   if (settings.fastCommit) args.push("--fast-commit");
   if (settings.debug) args.push("--debug");
@@ -629,28 +628,23 @@ function ConfigView({
           {/* Speech Recognition */}
           <ConfigSection icon={Mic2} title="Speech Recognition" subtitle="ASR engine and model settings">
             <SettingRow label="Profile">
-              <FloureSelect
+               <FloureSelect
                 value={settings.asrProfile}
                 onChange={(e) => setSettings((s) => ({ ...s, asrProfile: e.target.value as RuntimeSettings["asrProfile"] }))}
               >
-                <option value="auto">Auto</option>
-                <option value="speed">Speed</option>
-                <option value="balanced">Balanced</option>
-                <option value="accuracy">Accuracy</option>
-                <option value="distil">Distil</option>
-                <option value="turbo">Turbo</option>
+                <option value="parakeet">Parakeet TDT (English)</option>
+                <option value="whisper-turbo">Whisper large-v3-turbo (Multilingual)</option>
+                <option value="whisper-base">Whisper base (Lightweight)</option>
               </FloureSelect>
             </SettingRow>
-            <SettingRow label="Backend">
-              <FloureSelect
-                value={settings.backend}
-                onChange={(e) => setSettings((s) => ({ ...s, backend: e.target.value as RuntimeSettings["backend"] }))}
-              >
-                <option value="auto">Auto</option>
-                <option value="whisper_cpp">whisper.cpp</option>
-                <option value="faster_whisper">faster-whisper</option>
-              </FloureSelect>
-            </SettingRow>
+             <SettingRow label="Backend">
+               <FloureSelect
+                 value={settings.backend}
+                 onChange={(e) => setSettings((s) => ({ ...s, backend: e.target.value as RuntimeSettings["backend"] }))}
+               >
+                 <option value="sherpa_onnx">sherpa-onnx (Rust native)</option>
+               </FloureSelect>
+             </SettingRow>
             <SettingRow label="Model">
               <FloureInput
                 value={settings.model}
@@ -692,7 +686,7 @@ function ConfigView({
           {/* Permissions */}
           <div
             ref={permissionsRef}
-            className={`rounded-[12px] transition-all duration-500 ${
+            className={`rounded-[12px] transition-all duration-200 ${
               highlightPermissions
                 ? "bg-[#FFE3E5] ring-2 ring-accent/40"
                 : ""
@@ -930,7 +924,7 @@ function App() {
       try {
         const { getCurrentWindow } = await import("@tauri-apps/api/window");
         const win = getCurrentWindow();
-        const prefix = status === "idle" ? "○" : status === "listening" ? "🎙" : status === "transcribing" ? "✍" : "●";
+        const prefix = status === "idle" ? "[·]" : status === "listening" ? "[rec]" : status === "transcribing" ? "[tx]" : "[on]";
         await win.setTitle(`${prefix} STT — ${status}`);
       } catch { /* not in Tauri */ }
     })();
@@ -991,7 +985,6 @@ function App() {
     }
     if (event.type === "mic") {
       micLevelEmitter.emit(event.level);
-      // Forward mic level to widget
       (async () => {
         try {
           const { emit } = await import("@tauri-apps/api/event");
@@ -1000,48 +993,63 @@ function App() {
       })();
       return;
     }
-    if (event.type === "error") {
-      setToast(event.message);
-      setStatus("error");
-      addError("general", event.message, true);
-      if (event.utterance_id) {
-        setLines((prev) => prev.map((line) =>
-          line.id === event.utterance_id ? { ...line, status: "error" } : line
-        ));
-      }
+    if (event.type === "asr_ready") {
+      setResolvedModel({ profile: "parakeet", model: "Parakeet TDT", backend: event.backend, device: "cuda" });
+      setToast("Engine ready — models loaded");
       return;
     }
-    if (event.type === "dropped") {
-      setToast(`Dropped (${event.reason})`);
+    if (event.type === "asr_partial") {
+      setStatus("transcribing");
+      const id = nextLocalId.current;
+      setLines((prev) => {
+        const last = prev[prev.length - 1];
+        if (last && last.status === "transcribing") {
+          return [...prev.slice(0, -1), { ...last, raw: event.text }];
+        }
+        return [...prev, { id, raw: event.text, processed: "", status: "transcribing", createdAt: new Date().toISOString() }].slice(-500);
+      });
       return;
     }
-    if (event.type === "info") {
-      setResolvedModel({ profile: event.profile, model: event.model, backend: event.backend, device: event.device });
+    if (event.type === "asr_final") {
+      setLines((prev) => {
+        const last = prev[prev.length - 1];
+        if (last && last.status === "transcribing") {
+          return [...prev.slice(0, -1), { ...last, raw: event.text, processed: event.text, status: "transcribing", createdAt: last.createdAt }];
+        }
+        return [...prev, { id: nextLocalId.current++, raw: event.text, processed: event.text, status: "transcribing", createdAt: new Date().toISOString() }].slice(-500);
+      });
       return;
     }
-    if (event.type === "raw") {
-      const id = event.utterance_id ?? nextLocalId.current++;
-      setLines((prev) => [
-        ...prev,
-        { id, raw: event.text, processed: "", status: "transcribing", createdAt: new Date().toISOString() },
-      ].slice(-500));
+    if (event.type === "llm_start") {
+      setLines((prev) => {
+        const last = prev[prev.length - 1];
+        if (last) {
+          return [...prev.slice(0, -1), { ...last, status: "rewriting" }];
+        }
+        return prev;
+      });
       return;
     }
-    if (event.type === "processed") {
-      const id = event.utterance_id;
-      if (!id) return;
-      setLines((prev) => prev.map((line) =>
-        line.id === id ? { ...line, processed: event.text, status: "done" } : line
-      ));
-      pttTextRef.current = event.text;
+    if (event.type === "llm_token") {
+      setLines((prev) => {
+        const last = prev[prev.length - 1];
+        if (last) {
+          const updatedProcessed = (last.processed || "") + event.text;
+          return [...prev.slice(0, -1), { ...last, processed: updatedProcessed, status: "rewriting" }];
+        }
+        return prev;
+      });
+      return;
     }
-    if (event.type === "llm_partial") {
-      const id = event.utterance_id;
-      if (!id) return;
-      setLines((prev) => prev.map((line) =>
-        line.id === id ? { ...line, processed: event.text, status: "rewriting" } : line
-      ));
-      pttTextRef.current = event.text;
+    if (event.type === "llm_end") {
+      setLines((prev) => {
+        const last = prev[prev.length - 1];
+        if (last) {
+          return [...prev.slice(0, -1), { ...last, processed: event.text, status: "done" }];
+        }
+        return prev;
+      });
+      return;
     }
   };
 

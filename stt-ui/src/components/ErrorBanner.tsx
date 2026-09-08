@@ -18,12 +18,12 @@ interface Props {
   onClose: () => void;
 }
 
-const CATEGORY_ICONS: Record<string, string> = {
-  connection: "🔌",
-  model: "🧠",
-  mic: "🎤",
-  permission: "🔒",
-  general: "⚠️",
+const CATEGORY_LABELS: Record<string, string> = {
+  connection: "conn",
+  model: "model",
+  mic: "mic",
+  permission: "perm",
+  general: "error",
 };
 
 const CATEGORY_DOT: Record<string, string> = {
@@ -48,7 +48,7 @@ export default function ErrorSidePanel({ errors, onDismiss, onRetry, visible, on
       aria-label="Error log"
     >
       <div className="flex items-center justify-between px-4 py-3 border-b border-border">
-        <h2 className="text-subheading text-text-primary">⚠️ Errors ({activeErrors.length})</h2>
+        <h2 className="text-subheading text-text-primary">Errors ({activeErrors.length})</h2>
         <button
           className={cn(
             "inline-flex items-center justify-center rounded-button h-8 px-3 text-small font-medium transition-all duration-200",
@@ -78,8 +78,8 @@ export default function ErrorSidePanel({ errors, onDismiss, onRetry, visible, on
               >
                 <div className="flex items-start gap-3 px-3 py-2.5">
                   <span className={cn("mt-0.5 h-2 w-2 rounded-full shrink-0", CATEGORY_DOT[err.category] || "bg-red-500")} aria-hidden="true" />
-                  <span className="text-text-primary" aria-hidden="true">
-                    {CATEGORY_ICONS[err.category] || "⚠️"}
+                  <span className="text-[10px] font-semibold uppercase tracking-wider text-text-muted px-1.5 py-0.5 rounded bg-app-surface border border-border" aria-hidden="true">
+                    {CATEGORY_LABELS[err.category] || "error"}
                   </span>
                   <span className="flex-1 text-body text-text-primary">
                     {err.message}
