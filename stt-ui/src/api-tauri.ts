@@ -1,7 +1,22 @@
 // ── Tauri native backend: uses Rust commands + Tauri events ──
 import { type STTApi, type STTEvent } from "./api";
 
-export function createTauriApi(): STTApi {
+type EngineStatus = "idle" | "listening" | "transcribing" | "rewriting" | "done" | "error";
+
+let currentStatus: EngineStatus = "idle";
+let nextUtteranceId = 0;
+let currentText = "";
+
+interface TauriPayload {
+  text?: string;
+  backend?: string;
+  latency_ms?: number;
+}
+
+// _cliArgs accepted for call-site compatibility (App/tests pass CLI args);
+// the native Tauri backend runs in-process so there is nothing to spawn with them.
+export function createTauriApi(_cliArgs?: string[]): STTApi {
+  void _cliArgs;
   let listeners: Array<(e: STTEvent) => void> = [];
   let unlistenFns: Array<() => void> = [];
 
@@ -9,31 +24,41 @@ export function createTauriApi(): STTApi {
     for (const cb of listeners) cb(e);
   };
 
-  const handleEvent = (name: string, payload: any) => {
-    currentStatus = "listening";
+  const fail = (message: string, e: unknown) => {
+    currentStatus = "error";
+    console.error(message, e);
+    emit({ type: "state", state: currentStatus });
+  };
+
+  const handleEvent = (name: string, payload: TauriPayload) => {
     switch (name) {
       case "asr_ready":
+        currentStatus = "idle";
         emit({ type: "asr_ready", backend: payload.backend ?? "parakeet" });
-        emit({ type: "state", state: "idle" });
+        emit({ type: "state", state: currentStatus });
         break;
       case "asr_partial":
         currentStatus = "transcribing";
-        emit({ type: "asr_partial", text: payload.text ?? "" });
+        currentText = payload.text ?? currentText;
+        emit({ type: "asr_partial", text: currentText });
         break;
       case "asr_final":
-        emit({ type: "asr_final", text: payload.text ?? "", latency_ms: payload.latency_ms ?? 0 });
+        currentText = payload.text ?? currentText;
+        emit({ type: "asr_final", text: currentText, latency_ms: payload.latency_ms ?? 0 });
         break;
       case "llm_start":
         currentStatus = "rewriting";
         emit({ type: "llm_start" });
-        emit({ type: "state", state: "rewriting" });
+        emit({ type: "state", state: currentStatus });
         break;
       case "llm_token":
         emit({ type: "llm_token", text: payload.text ?? "" });
         break;
       case "llm_end":
-        emit({ type: "llm_end", text: payload.text ?? "" });
-        emit({ type: "state", state: "done" });
+        currentStatus = "done";
+        currentText = payload.text ?? currentText;
+        emit({ type: "llm_end", text: currentText });
+        emit({ type: "state", state: currentStatus });
         break;
       default:
         break;
@@ -52,12 +77,13 @@ export function createTauriApi(): STTApi {
         "llm_start", "llm_token", "llm_end",
       ];
       for (const eventName of events) {
-        const unlisten = await listen(eventName, (event) => {
-          handleEvent(eventName, event.payload);
+        const unlisten = await listen<TauriPayload>(eventName, (event) => {
+          handleEvent(eventName, event.payload ?? {});
         });
         unlistenFns.push(unlisten);
       }
-      emit({ type: "state", state: "idle" });
+      currentStatus = "idle";
+      emit({ type: "state", state: currentStatus });
     },
 
     kill() {
@@ -66,44 +92,45 @@ export function createTauriApi(): STTApi {
       listeners = [];
     },
 
-    start() {
-      (async () => {
+    async start() {
+      try {
         const { invoke } = await import("@tauri-apps/api/core");
-        try {
+        await invoke("start_listening");
+        currentText = "";
+        nextUtteranceId += 1;
+        currentStatus = "listening";
+      } catch (e) {
+        fail("[Tauri] start_listening failed", e);
+      }
+    },
+
+    async stop() {
+      try {
+        const { invoke } = await import("@tauri-apps/api/core");
+        await invoke("stop_listening");
+        currentStatus = "done";
+        emit({ type: "state", state: currentStatus });
+      } catch (e) {
+        fail("[Tauri] stop_listening failed", e);
+      }
+    },
+
+    async sendCommand(cmd: Record<string, unknown>) {
+      try {
+        const { invoke } = await import("@tauri-apps/api/core");
+        if (cmd.type === "start_recording") {
           await invoke("start_listening");
           currentText = "";
           nextUtteranceId += 1;
-        } catch (e) {
-          emit({ type: "state", state: "error" });
-        }
-      })();
-    },
-
-    stop() {
-      (async () => {
-        const { invoke } = await import("@tauri-apps/api/core");
-        try {
+          currentStatus = "listening";
+        } else if (cmd.type === "stop_recording") {
           await invoke("stop_listening");
-          emit({ type: "state", state: "done" });
-        } catch (e) {
-          emit({ type: "state", state: "error" });
+          currentStatus = "done";
+          emit({ type: "state", state: currentStatus });
         }
-      })();
-    },
-
-    sendCommand(cmd: Record<string, unknown>) {
-      (async () => {
-        const { invoke } = await import("@tauri-apps/api/core");
-        try {
-          if (cmd.type === "start_recording") {
-            await invoke("start_listening");
-          } else if (cmd.type === "stop_recording") {
-            await invoke("stop_listening");
-          }
-        } catch (e) {
-          emit({ type: "state", state: "error" });
-        }
-      })();
+      } catch (e) {
+        fail("[Tauri] sendCommand failed", e);
+      }
     },
   };
 }

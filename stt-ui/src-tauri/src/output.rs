@@ -27,8 +27,9 @@ pub fn type_text(text: &str) -> Result<bool> {
     match (platform, display_server) {
         ("windows", _) => type_windows_paste(text),
         ("linux", "wayland") => type_via_command(text, "wtype", &[]),
-        ("linux", "x11") => type_via_command(text, "xdotool", &["type", "--clearmodifiers"]),
-        ("linux", "unknown") => type_via_command(text, "xdotool", &["type", "--clearmodifiers"]),
+        ("linux", "x11") | ("linux", "unknown") => {
+            type_via_command(text, "xdotool", &["type", "--clearmodifiers"])
+        }
         ("macos", _) => {
             let escaped = text.replace('\\', "\\\\").replace('"', "\\\"");
             let script = format!("tell application \"System Events\" to keystroke \"{escaped}\"");
@@ -39,15 +40,47 @@ pub fn type_text(text: &str) -> Result<bool> {
     }
 }
 
-fn type_via_command(text: &str, tool: &str, prefix_args: &[&str]) -> Result<bool> {
-    let output = Command::new(tool)
-        .args(prefix_args)
-        .arg(text)
-        .output()?;
-    Ok(output.status.success())
+pub fn copy_to_clipboard(text: &str) -> Result<bool> {
+    if text.is_empty() {
+        return Ok(false);
+    }
+
+    let (platform, display_server) = detect_platform();
+
+    match (platform, display_server) {
+        ("windows", _) => copy_via_command(text, "clip.exe", &[]),
+        ("linux", "wayland") => copy_via_command(text, "wl-copy", &[]),
+        ("linux", "x11") | ("linux", "unknown") => {
+            copy_via_command(text, "xclip", &["-selection", "clipboard"])
+        }
+        ("macos", _) => {
+            let escaped = text.replace('\\', "\\\\").replace('"', "\\\"");
+            let script = format!("tell application \"System Events\" to keystroke \"{escaped}\"");
+            let output = Command::new("osascript").args(["-e", &script]).output()?;
+            Ok(output.status.success())
+        }
+        _ => Err(anyhow::anyhow!("No clipboard backend available")),
+    }
 }
 
-fn type_windows_paste(text: &str) -> Result<bool> {
+pub fn save_to_history(
+    text: &str,
+    raw_text: &str,
+    mode: &str,
+    model: &str,
+    db_path: &std::path::Path,
+) -> Result<()> {
+    use rusqlite::Connection;
+    let conn = Connection::open(db_path)?;
+    conn.execute(
+        "INSERT INTO transcripts (raw_text, processed_text, language, mode, model, duration_sec)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+        rusqlite::params![raw_text, text, "en", mode, model, 0.0f64],
+    )?;
+    Ok(())
+}
+
+pub fn type_windows_paste(text: &str) -> Result<bool> {
     let escaped = text.replace("'", "''");
     let ps_script = format!(
         "Add-Type -AssemblyName System.Windows.Forms; \
@@ -62,23 +95,7 @@ fn type_windows_paste(text: &str) -> Result<bool> {
     Ok(output.status.success())
 }
 
-pub fn copy_to_clipboard(text: &str) -> Result<bool> {
-    if text.is_empty() {
-        return Ok(false);
-    }
-
-    let (platform, display_server) = detect_platform();
-
-    match (platform, display_server) {
-        ("windows", _) => copy_via_command(text, "clip.exe", &[]),
-        ("linux", "wayland") => copy_via_command(text, "wl-copy", &[]),
-        ("linux", "x11") => copy_via_command(text, "xclip", &["-selection", "clipboard"]),
-        ("macos", _) => copy_via_command(text, "pbcopy", &[]),
-        _ => Err(anyhow::anyhow!("No clipboard backend available")),
-    }
-}
-
-fn copy_via_command(text: &str, tool: &str, prefix_args: &[&str]) -> Result<bool> {
+pub fn type_via_command(text: &str, tool: &str, prefix_args: &[&str]) -> Result<bool> {
     let mut child = Command::new(tool)
         .args(prefix_args)
         .stdin(std::process::Stdio::piped())
@@ -95,18 +112,19 @@ fn copy_via_command(text: &str, tool: &str, prefix_args: &[&str]) -> Result<bool
     Ok(status.success())
 }
 
-pub fn save_to_history(
-    text: &str,
-    raw_text: &str,
-    mode: &str,
-    model: &str,
-    db_path: &std::path::Path,
-) -> Result<()> {
-    let conn = rusqlite::Connection::open(db_path)?;
-    conn.execute(
-        "INSERT INTO transcripts (raw_text, processed_text, language, mode, model, duration_sec)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
-        rusqlite::params![raw_text, text, "en", mode, model, 0.0f64],
-    )?;
-    Ok(())
+pub fn copy_via_command(text: &str, tool: &str, prefix_args: &[&str]) -> Result<bool> {
+    let mut child = Command::new(tool)
+        .args(prefix_args)
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()?;
+
+    if let Some(ref mut stdin) = child.stdin {
+        use std::io::Write;
+        stdin.write_all(text.as_bytes())?;
+    }
+
+    let status = child.wait()?;
+    Ok(status.success())
 }

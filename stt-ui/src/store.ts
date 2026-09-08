@@ -6,6 +6,21 @@ export type ASRMODEL = "parakeet" | "whisper-turbo" | "whisper-base";
 export type LLMBackend = "local" | "deepseek" | "openrouter";
 export type LLMMode = "off" | "cleanup" | "bullet_list" | "email" | "commit_message";
 
+export type LlmModelBackend = "llama_cpp" | "deepseek" | "openrouter";
+
+export interface LlmModelInfo {
+  id: string;
+  name: string;
+  size: string;
+  sizeBytes: number;
+  bestFor: string;
+  backend: LlmModelBackend;
+  downloaded: boolean;
+  recommended: boolean;
+  url: string;
+  filename?: string;
+}
+
 export interface ModelInfo {
   id: string;
   name: string;
@@ -66,20 +81,18 @@ export const MODEL_CATALOG: ModelInfo[] = [
   },
 ];
 
-export const LLM_MODEL_CATALOG: ModelInfo[] = [
+export const LLM_MODEL_CATALOG: LlmModelInfo[] = [
   {
     id: "gemma-3-1b-it-q4_k_m",
     name: "Gemma 3 1B IT (Q4_K_M)",
     size: "~500 MB",
     sizeBytes: 500_000_000,
-    speed: "⚡ Fast",
-    accuracy: "⭐⭐⭐",
     bestFor: "Offline text cleaning",
-    backend: "sherpa_onnx",
-    profile: "whisper-base",
+    backend: "llama_cpp",
     downloaded: false,
     recommended: true,
     url: "https://huggingface.co/unsloth/gemma-3-1b-it-gguf/resolve/main/gemma-3-1b-it-q4_k_m.gguf",
+    filename: "gemma-3-1b-it-q4_k_m.gguf",
   },
 ];
 

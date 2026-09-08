@@ -11,6 +11,26 @@ pub enum LlmMode {
     CommitMessage,
 }
 
+impl Default for LlmMode {
+    fn default() -> Self {
+        // Matches the pipeline's historical behavior (always Cleanup).
+        Self::Cleanup
+    }
+}
+
+impl LlmMode {
+    /// Storage/display label used in the history DB `mode` column.
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::Off => "off",
+            Self::Cleanup => "cleanup",
+            Self::BulletList => "bullet_list",
+            Self::Email => "email",
+            Self::CommitMessage => "commit_message",
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
 pub enum LlmBackend {
     Local,
@@ -131,6 +151,28 @@ impl LlmCleanup {
         })
     }
 
+    fn endpoint_url(&self) -> Option<&'static str> {
+        match self.backend {
+            LlmBackend::DeepSeek => Some("https://api.deepseek.com/v1/chat/completions"),
+            LlmBackend::OpenRouter => Some("https://openrouter.ai/api/v1/chat/completions"),
+            LlmBackend::Local => None,
+        }
+    }
+
+    fn cloud_model(&self) -> String {
+        match self.backend {
+            LlmBackend::DeepSeek => std::env::var("DEEPSEEK_MODEL")
+                .ok()
+                .filter(|s| !s.trim().is_empty())
+                .unwrap_or_else(|| "deepseek-chat".to_string()),
+            LlmBackend::OpenRouter => std::env::var("OPENROUTER_MODEL")
+                .ok()
+                .filter(|s| !s.trim().is_empty())
+                .unwrap_or_else(|| "deepseek/deepseek-chat".to_string()),
+            LlmBackend::Local => String::new(),
+        }
+    }
+
     pub fn stream_cleanup<F: FnMut(String) + Send + 'static>(
         &mut self,
         prompt: &str,
@@ -202,14 +244,12 @@ impl LlmCleanup {
             .as_ref()
             .ok_or_else(|| anyhow::anyhow!("API key not set"))?;
 
-        let url = match self.backend {
-            LlmBackend::DeepSeek => "https://api.deepseek.com/v1/chat/completions",
-            LlmBackend::OpenRouter => "https://openrouter.ai/api/v1/chat/completions",
-            LlmBackend::Local => return Err(anyhow::anyhow!("Invalid backend")),
-        };
+        let url = self
+            .endpoint_url()
+            .ok_or_else(|| anyhow::anyhow!("Invalid backend"))?;
 
         let body = serde_json::json!({
-            "model": "deepseek-chat",
+            "model": self.cloud_model(),
             "stream": true,
             "messages": [{"role": "user", "content": prompt}]
         });
@@ -232,13 +272,112 @@ impl LlmCleanup {
 
             let mut stream = response.bytes_stream();
             use futures_util::StreamExt;
+            let mut buffer = String::new();
             while let Some(chunk) = stream.next().await {
                 let chunk = chunk.map_err(|e| anyhow::anyhow!("Stream error: {}", e))?;
                 let text = String::from_utf8_lossy(&chunk);
-                callback(text.to_string());
+                for token in drain_sse_buffer(&mut buffer, &text) {
+                    callback(token);
+                }
+            }
+            // Flush any trailing line without a newline terminator.
+            for token in drain_sse_buffer(&mut buffer, "\n") {
+                callback(token);
             }
 
             Ok(())
         })
+    }
+}
+
+/// Extract the delta text from a single SSE line.
+///
+/// Handles OpenAI-compatible chunks: strips an optional `data:` prefix,
+/// skips `[DONE]` sentinels / empty lines / SSE comments, and returns
+/// `choices[0].delta.content` when present. Returns `None` when the line
+/// carries no token text.
+fn extract_delta_content(line: &str) -> Option<String> {
+    let line = line.trim();
+    if line.is_empty() {
+        return None;
+    }
+    // SSE comments (keep-alive `: ...`) carry no data.
+    if line.starts_with(':') {
+        return None;
+    }
+    let data = if let Some(rest) = line.strip_prefix("data:") {
+        rest.trim()
+    } else if line.starts_with('{') {
+        // Lenient: accept bare JSON lines (some proxies strip the prefix).
+        line
+    } else {
+        return None;
+    };
+    if data.is_empty() || data == "[DONE]" {
+        return None;
+    }
+    let value: serde_json::Value = serde_json::from_str(data).ok()?;
+    value
+        .get("choices")?
+        .get(0)?
+        .get("delta")?
+        .get("content")?
+        .as_str()
+        .map(|s| s.to_string())
+}
+
+/// Append `chunk_text` to `buffer`, extract complete `\n`-terminated lines,
+/// and return the parsed token texts. Any incomplete trailing line stays in
+/// `buffer` for the next chunk.
+fn drain_sse_buffer(buffer: &mut String, chunk_text: &str) -> Vec<String> {
+    buffer.push_str(chunk_text);
+    let mut tokens = Vec::new();
+    while let Some(pos) = buffer.find('\n') {
+        let line: String = buffer.drain(..=pos).collect();
+        if let Some(token) = extract_delta_content(&line) {
+            if !token.is_empty() {
+                tokens.push(token);
+            }
+        }
+    }
+    tokens
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn extracts_delta_content_from_data_line() {
+        let line = r#"data: {"choices":[{"delta":{"content":"hello"}}]}"#;
+        assert_eq!(extract_delta_content(line).as_deref(), Some("hello"));
+    }
+
+    #[test]
+    fn skips_done_empty_and_comment_lines() {
+        assert_eq!(extract_delta_content("data: [DONE]"), None);
+        assert_eq!(extract_delta_content(""), None);
+        assert_eq!(extract_delta_content(": keep-alive"), None);
+        assert_eq!(
+            extract_delta_content(r#"data: {"choices":[{"delta":{}}]}"#),
+            None
+        );
+    }
+
+    #[test]
+    fn buffers_incomplete_lines_across_chunks() {
+        let mut buffer = String::new();
+        let first = drain_sse_buffer(
+            &mut buffer,
+            "data: {\"choices\":[{\"delta\":{\"content\":\"hel",
+        );
+        assert!(first.is_empty());
+        assert!(!buffer.is_empty());
+        let second = drain_sse_buffer(
+            &mut buffer,
+            "lo\"}}]}\n\ndata: [DONE]\n",
+        );
+        assert_eq!(second, vec!["hello".to_string()]);
+        assert!(buffer.is_empty());
     }
 }

@@ -1,4 +1,5 @@
 use anyhow::Result;
+use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
 
 #[derive(Debug, Clone)]
@@ -75,6 +76,61 @@ pub fn model_path(models_dir: &Path, model: &ModelManifest) -> PathBuf {
     models_dir.join(model.id)
 }
 
+pub struct ModelManager {
+    model_dir: PathBuf,
+}
+
+impl ModelManager {
+    pub fn new(model_dir: PathBuf) -> Self {
+        Self { model_dir }
+    }
+
+    pub fn status(&self) -> Vec<ModelStatus> {
+        let mut statuses = Vec::new();
+
+        for model in MODEL_MANIFEST {
+            let model_dir = self.model_dir.join(model.id);
+            let downloaded = self.verify(&model.id);
+            let (downloaded_flag, size_bytes) = if model_dir.exists() {
+                let total = walk_dir_size(&model_dir).unwrap_or(0);
+                (true, total)
+            } else {
+                (false, 0)
+            };
+            statuses.push(ModelStatus {
+                name: model.name.to_string(),
+                id: model.id.to_string(),
+                downloaded: downloaded || downloaded_flag,
+                path: model_dir.to_string_lossy().to_string(),
+                size_bytes,
+                url: model.url.to_string(),
+                backend: model.backend.to_string(),
+                recommended: model.recommended,
+            });
+        }
+
+        statuses
+    }
+
+    pub fn verify(&self, id: &str) -> bool {
+        let model_opt = find_model(id);
+        if let Some(model) = model_opt {
+            verify_model(&self.model_dir, model)
+        } else {
+            false
+        }
+    }
+
+    pub async fn download(&self, id: &str, mut progress: impl FnMut(usize, u64)) -> Result<()> {
+        let model_opt = find_model(id);
+        if let Some(model) = model_opt {
+            download_model(model, &self.model_dir, |p, b| progress(p, b)).await
+        } else {
+            Err(anyhow::anyhow!("Model not found: {}", id))
+        }
+    }
+}
+
 pub async fn download_model(
     model: &ModelManifest,
     target_dir: &Path,
@@ -100,7 +156,7 @@ pub async fn download_model(
 
     let total = response.content_length().unwrap_or(model.size_bytes);
 
-    let (final_path, is_archive) = if model.is_archive {
+    let (final_path, _is_archive) = if model.is_archive {
         let archive_path = model_dir.join("model.tar.bz2");
         let mut file = tokio::fs::File::create(&archive_path).await?;
         let mut downloaded: u64 = 0;
@@ -148,7 +204,7 @@ pub async fn download_model(
         (file_path, false)
     };
 
-    let _ = (final_path, is_archive);
+    let _ = (final_path, _is_archive);
     std::fs::write(model_dir.join(".downloaded"), b"")?;
 
     Ok(())
@@ -180,4 +236,32 @@ pub fn verify_model(models_dir: &Path, model: &ModelManifest) -> bool {
         }
         _ => false,
     }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ModelStatus {
+    pub name: String,
+    pub id: String,
+    pub downloaded: bool,
+    pub path: String,
+    pub size_bytes: u64,
+    pub url: String,
+    pub backend: String,
+    pub recommended: bool,
+}
+
+pub(crate) fn walk_dir_size(path: &std::path::Path) -> Result<u64, anyhow::Error> {
+    let mut total = 0u64;
+    if path.is_dir() {
+        for entry in std::fs::read_dir(path).map_err(|e| anyhow::anyhow!(e))? {
+            let entry = entry.map_err(|e| anyhow::anyhow!(e))?;
+            let meta = entry.metadata().map_err(|e| anyhow::anyhow!(e))?;
+            if meta.is_file() {
+                total += meta.len();
+            } else if meta.is_dir() {
+                total += walk_dir_size(&entry.path())?;
+            }
+        }
+    }
+    Ok(total)
 }

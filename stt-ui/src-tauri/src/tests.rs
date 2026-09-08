@@ -1,6 +1,7 @@
 #[cfg(test)]
 mod tests {
     use crate::*;
+    use crate::models::walk_dir_size;
     use crate::widget::{detect_window_manager, WidgetPosition, WindowManagerInfo};
     use rusqlite::Connection;
     use std::path::Path;
@@ -22,7 +23,7 @@ mod tests {
         std::env::remove_var("STT_DATA_DIR");
         let path = history_db_path().unwrap();
         let home = dirs_next::home_dir().unwrap();
-        assert_eq!(path, home.join(".local/share/stt/history.db"));
+        assert_eq!(path, home.join(".local/share/floure/history.db"));
     }
 
     // -----------------------------------------------------------------------
@@ -159,9 +160,13 @@ mod tests {
     fn test_model_status_serializes() {
         let status = ModelStatus {
             name: "tiny.en".to_string(),
+            id: "tiny.en".to_string(),
             downloaded: true,
             path: "/tmp/model.bin".to_string(),
             size_bytes: 1024,
+            url: "https://example.com/model.bin".to_string(),
+            backend: "sherpa_onnx".to_string(),
+            recommended: false,
         };
         let json = serde_json::to_value(&status).unwrap();
         assert_eq!(json["name"], "tiny.en");
