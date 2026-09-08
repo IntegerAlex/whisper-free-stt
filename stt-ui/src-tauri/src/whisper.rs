@@ -1,30 +1,87 @@
 use anyhow::Result;
 use sherpa_onnx::{OfflineRecognizer, OfflineRecognizerConfig};
+use std::path::PathBuf;
 
 pub struct WhisperRecognizer {
     recognizer: OfflineRecognizer,
+    model_dir: PathBuf,
+    num_threads: i32,
+    debug: bool,
+    language: Option<String>,
+}
+
+/// Map a UI language setting to the Whisper `language` config value:
+/// `"auto"`/`""` (and whitespace-only) mean auto-detect (`None`).
+fn normalize_language(lang: &str) -> Option<String> {
+    let trimmed = lang.trim();
+    if trimmed.is_empty() || trimmed == "auto" {
+        None
+    } else {
+        Some(trimmed.to_string())
+    }
+}
+
+fn build_recognizer(
+    model_dir: &std::path::Path,
+    num_threads: i32,
+    debug: bool,
+    language: Option<String>,
+) -> Result<OfflineRecognizer> {
+    let encoder = model_dir.join("whisper-encoder.onnx");
+    let decoder = model_dir.join("whisper-decoder.onnx");
+    let tokens = model_dir.join("vocabulary.json");
+
+    let mut config = OfflineRecognizerConfig::default();
+    config.model_config.whisper.encoder = Some(encoder.to_str().unwrap().into());
+    config.model_config.whisper.decoder = Some(decoder.to_str().unwrap().into());
+    config.model_config.whisper.language = language;
+    config.model_config.whisper.task = Some("transcribe".to_string());
+    config.model_config.tokens = Some(tokens.to_str().unwrap().into());
+    config.model_config.num_threads = num_threads;
+    config.model_config.debug = debug;
+    config.model_config.model_type = Some("whisper".to_string());
+
+    let recognizer = OfflineRecognizer::create(&config)
+        .ok_or_else(|| anyhow::anyhow!("Failed to create Whisper OfflineRecognizer"))?;
+
+    Ok(recognizer)
 }
 
 impl WhisperRecognizer {
     pub fn new(model_dir: &std::path::Path, num_threads: i32, debug: bool) -> Result<Self> {
-        let encoder = model_dir.join("whisper-encoder.onnx");
-        let decoder = model_dir.join("whisper-decoder.onnx");
-        let tokens = model_dir.join("vocabulary.json");
+        let language = Some("en".to_string());
+        let recognizer = build_recognizer(model_dir, num_threads, debug, language.clone())?;
 
-        let mut config = OfflineRecognizerConfig::default();
-        config.model_config.whisper.encoder = Some(encoder.to_str().unwrap().into());
-        config.model_config.whisper.decoder = Some(decoder.to_str().unwrap().into());
-        config.model_config.whisper.language = Some("en".to_string());
-        config.model_config.whisper.task = Some("transcribe".to_string());
-        config.model_config.tokens = Some(tokens.to_str().unwrap().into());
-        config.model_config.num_threads = num_threads;
-        config.model_config.debug = debug;
-        config.model_config.model_type = Some("whisper".to_string());
+        Ok(Self {
+            recognizer,
+            model_dir: model_dir.to_path_buf(),
+            num_threads,
+            debug,
+            language,
+        })
+    }
 
-        let recognizer = OfflineRecognizer::create(&config)
-            .ok_or_else(|| anyhow::anyhow!("Failed to create Whisper OfflineRecognizer"))?;
+    /// Set the recognition language. `"auto"` and `""` select auto-detect
+    /// (`None`); anything else is passed through as the Whisper language tag.
+    /// The underlying recognizer is rebuilt so the new language takes effect.
+    /// If the rebuild fails (e.g. missing model files), the previous
+    /// recognizer is kept and only the stored preference is updated.
+    pub fn set_language(&mut self, lang: &str) {
+        let new_language = normalize_language(lang);
+        if new_language == self.language {
+            return;
+        }
+        self.language = new_language.clone();
+        let model_dir = self.model_dir.clone();
+        if let Ok(recognizer) =
+            build_recognizer(&model_dir, self.num_threads, self.debug, new_language)
+        {
+            self.recognizer = recognizer;
+        }
+    }
 
-        Ok(Self { recognizer })
+    pub fn language(&self) -> Option<&str> {
+        self.language.as_deref()
     }
 
     pub fn transcribe(&self, samples: &[f32]) -> String {
@@ -35,5 +92,24 @@ impl WhisperRecognizer {
             .get_result()
             .map(|r| r.text)
             .unwrap_or_default()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::normalize_language;
+
+    #[test]
+    fn language_mapping_auto_and_empty_to_none() {
+        assert_eq!(normalize_language("auto"), None);
+        assert_eq!(normalize_language(""), None);
+        assert_eq!(normalize_language("   "), None);
+    }
+
+    #[test]
+    fn language_mapping_passthrough() {
+        assert_eq!(normalize_language("en"), Some("en".to_string()));
+        assert_eq!(normalize_language("de"), Some("de".to_string()));
+        assert_eq!(normalize_language("  fr  "), Some("fr".to_string()));
     }
 }

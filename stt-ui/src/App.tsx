@@ -125,7 +125,6 @@ function getInitialSettings(): RuntimeSettings {
 
 function buildCliArgs(settings: RuntimeSettings): string[] {
   const args: string[] = ["--asr-profile", settings.asrProfile, "--llm-mode", settings.llmMode];
-  if (settings.backend !== "sherpa_onnx") args.push("--backend", settings.backend);
   if (settings.model.trim()) args.push("--model", settings.model.trim());
   if (settings.llmProvider !== "openrouter") args.push("--llm-provider", settings.llmProvider);
   if (settings.llmModel.trim()) args.push("--llm-model", settings.llmModel.trim());

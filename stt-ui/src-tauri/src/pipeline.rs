@@ -30,9 +30,7 @@ impl LlmProcessor {
         let llm_model_path = config.model_dir.join("gemma-3-1b-it-q4_k_m.gguf");
         let llm = match LlmCleanup::new(LlmBackend::Local, Some(&llm_model_path)) {
             Ok(l) => Some(l),
-            Err(e) => {
-                None
-            }
+            Err(_) => None,
         };
         Self { llm, config }
     }
@@ -83,7 +81,6 @@ pub struct PipelineController {
     running: Arc<AtomicBool>,
     app: tauri::AppHandle,
     config: AppConfig,
-    llm_processor: LlmProcessor,
     silero_path: PathBuf,
     model_dir: PathBuf,
 }
@@ -126,13 +123,45 @@ impl PipelineController {
             return Err(anyhow::anyhow!("Silero VAD model not found"));
         }
 
-        let llm_processor = LlmProcessor::new(config.clone());
+        // Lazy download of the selected ASR model (mirrors the VAD pattern
+        // above): if the profile's model files are missing, fetch them now
+        // instead of failing later inside the worker thread.
+        let asr_model_id = config.asr_profile.model_id();
+        let asr_manifest = MODEL_MANIFEST
+            .iter()
+            .find(|m| m.id == asr_model_id)
+            .ok_or_else(|| anyhow::anyhow!("Unknown ASR model: {}", asr_model_id))?;
+        if !verify_model(&model_dir, asr_manifest) {
+            let asr_dir = config.asr_profile.model_dir(&model_dir);
+            std::fs::create_dir_all(&asr_dir)?;
+            let runtime = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()?;
+            let result = runtime.block_on(async {
+                download_model(asr_manifest, &asr_dir, |_, _| {}).await
+            });
+            if let Err(e) = result {
+                let _ = app.emit(
+                    "asr_error",
+                    serde_json::json!({"error": format!("Failed to download ASR model: {}", e)}),
+                );
+                running.store(false, Ordering::SeqCst);
+                return Err(anyhow::anyhow!("ASR model download failed"));
+            }
+            if !verify_model(&model_dir, asr_manifest) {
+                let _ = app.emit(
+                    "asr_error",
+                    serde_json::json!({"error": "ASR model files not found after download attempt"}),
+                );
+                running.store(false, Ordering::SeqCst);
+                return Err(anyhow::anyhow!("ASR model not found"));
+            }
+        }
 
         Ok(Self {
             running,
             app,
             config,
-            llm_processor,
             silero_path,
             model_dir,
         })
@@ -195,6 +224,11 @@ impl PipelineController {
             let model_id = config_clone.asr_profile.model_id();
             let model_dir = config_clone.asr_profile.model_dir(&config_clone.model_dir);
 
+            // Owns LLM cleanup/typing/clipboard/history for this worker thread.
+            // Created here (rather than moved from the controller) so inference
+            // stays on the thread that uses it.
+            let mut llm_processor = LlmProcessor::new(config_clone.clone());
+
             let mut parakeet: Option<ParakeetRecognizer> = None;
             let mut whisper: Option<WhisperRecognizer> = None;
 
@@ -215,7 +249,8 @@ impl PipelineController {
                     }
                     crate::config::AsrProfile::WhisperTurbo | crate::config::AsrProfile::WhisperBase => {
                         match WhisperRecognizer::new(&model_dir, 4, false) {
-                            Ok(r) => {
+                            Ok(mut r) => {
+                                r.set_language(&config_clone.language);
                                 whisper = Some(r);
                                 let _ = app_clone
                                     .emit("asr_ready", serde_json::json!({ "backend": "whisper" }));
@@ -262,6 +297,7 @@ impl PipelineController {
                                             "asr_final",
                                             serde_json::json!({ "text": final_text }),
                                         );
+                                        llm_processor.process(&final_text, &app_clone);
                                         rec.reset();
                                     }
                                     vad.reset_after_segment();
@@ -283,6 +319,7 @@ impl PipelineController {
                                             "latency_ms": latency_ms,
                                         }),
                                     );
+                                    llm_processor.process(&text, &app_clone);
                                 }
                             }
                             vad.reset_after_segment();

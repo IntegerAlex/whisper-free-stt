@@ -6,6 +6,19 @@ pub struct AudioCapture {
     pub sample_rate: u32,
 }
 
+/// Downmix interleaved multi-channel samples to mono `f32`.
+///
+/// Each output sample is the arithmetic mean of one `channels`-wide frame,
+/// after mapping each raw sample through `to_f32`.
+fn normalize_to_mono<S: Copy>(data: &[S], channels: usize, to_f32: impl Fn(S) -> f32 + Copy) -> Vec<f32> {
+    data.chunks(channels)
+        .map(|frame| {
+            let sum: f32 = frame.iter().copied().map(to_f32).sum();
+            sum / channels as f32
+        })
+        .collect()
+}
+
 pub fn list_input_devices() -> Result<Vec<(String, String)>> {
     let host = cpal::default_host();
     let mut devices = Vec::new();
@@ -52,13 +65,7 @@ where
                 if data.is_empty() {
                     return;
                 }
-                let mono: Vec<f32> = data
-                    .chunks(channels)
-                    .map(|frame| {
-                        let sum: f32 = frame.iter().copied().sum();
-                        sum / channels as f32
-                    })
-                    .collect();
+                let mono = normalize_to_mono(data, channels, |s| s);
                 callback(&mono);
             },
             err_fn,
@@ -70,16 +77,7 @@ where
                 if data.is_empty() {
                     return;
                 }
-                let mono: Vec<f32> = data
-                    .chunks(channels)
-                    .map(|frame| {
-                        let sum: f32 = frame
-                            .iter()
-                            .map(|&s| s as f32 / i16::MAX as f32)
-                            .sum();
-                        sum / channels as f32
-                    })
-                    .collect();
+                let mono = normalize_to_mono(data, channels, |s| s as f32 / i16::MAX as f32);
                 callback(&mono);
             },
             err_fn,
@@ -91,19 +89,7 @@ where
                 if data.is_empty() {
                     return;
                 }
-                let mono: Vec<f32> = data
-                    .chunks(channels)
-                    .map(|frame| {
-                        let sum: f32 = frame
-                            .iter()
-                            .map(|&s| {
-                                let centered = s as f32 - 32768.0;
-                                centered / 32768.0
-                            })
-                            .sum();
-                        sum / channels as f32
-                    })
-                    .collect();
+                let mono = normalize_to_mono(data, channels, |s| (s as f32 - 32768.0) / 32768.0);
                 callback(&mono);
             },
             err_fn,
@@ -118,4 +104,26 @@ where
         _stream: stream,
         sample_rate,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn downmixes_stereo_f32_by_averaging() {
+        let mono = normalize_to_mono(&[0.5f32, -0.5, 1.0, 1.0], 2, |s| s);
+        assert_eq!(mono, vec![0.0, 1.0]);
+    }
+
+    #[test]
+    fn converts_i16_and_u16_samples() {
+        let mono = normalize_to_mono(&[i16::MAX, 0], 2, |s| s as f32 / i16::MAX as f32);
+        assert_eq!(mono, vec![0.5]);
+        // u16 silence level (32768) maps to 0.0.
+        let mono = normalize_to_mono(&[32768u16, 32768], 2, |s| {
+            (s as f32 - 32768.0) / 32768.0
+        });
+        assert_eq!(mono, vec![0.0]);
+    }
 }

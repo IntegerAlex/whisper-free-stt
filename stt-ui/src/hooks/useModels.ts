@@ -1,11 +1,11 @@
 // ── Model management hook: check status, download, track progress ──
 import { useState, useCallback, useEffect, useRef } from "react";
 import { MODEL_CATALOG } from "../store";
-import type { ModelInfo } from "../store";
+import type { ASRBackend, ModelInfo } from "../store";
 
 export interface ModelStatusEntry {
   name: string;
-  backend: "whisper_cpp" | "faster_whisper";
+  backend: ASRBackend | "whisper_cpp" | "faster_whisper";
   downloaded: boolean;
   downloading: boolean;
   progress: number;
@@ -53,7 +53,7 @@ export function useModels() {
 
       setModels((prev) =>
         prev.map((m) => {
-          // Match by name across both whisper_cpp and faster_whisper entries
+          // Match by name across catalog entries
           const status = rustStatuses.find((s) => s.name === m.name);
           if (status) {
             return {

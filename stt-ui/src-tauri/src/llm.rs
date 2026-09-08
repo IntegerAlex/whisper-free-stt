@@ -200,7 +200,10 @@ impl LlmCleanup {
             .as_ref()
             .ok_or_else(|| anyhow::anyhow!("Local LLM model not loaded"))?;
 
-        let mut ctx = model.new_context(backend, LlamaContextParams::default())?;
+        let ctx_params = LlamaContextParams::default()
+            .with_n_ctx(std::num::NonZeroU32::new(512))
+            .with_n_threads(4);
+        let mut ctx = model.new_context(backend, ctx_params)?;
         let mut batch = LlamaBatch::new(512, 1);
 
         let tokens = model.str_to_token(prompt, AddBos::Always)?;

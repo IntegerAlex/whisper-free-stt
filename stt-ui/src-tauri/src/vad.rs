@@ -6,8 +6,7 @@ pub struct VoiceActivityDetector {
     buffer: Vec<f32>,
     offset: usize,
     window_size: usize,
-    speech_started: bool,
-    last_partial_time: std::time::Instant,
+    threshold: f32,
 }
 
 impl VoiceActivityDetector {
@@ -30,8 +29,7 @@ impl VoiceActivityDetector {
             buffer: Vec::new(),
             offset: 0,
             window_size: 512,
-            speech_started: false,
-            last_partial_time: std::time::Instant::now(),
+            threshold,
         })
     }
 
@@ -41,29 +39,12 @@ impl VoiceActivityDetector {
         while self.offset + self.window_size <= self.buffer.len() {
             self.vad
                 .accept_waveform(&self.buffer[self.offset..self.offset + self.window_size]);
-
-            if !self.speech_started && self.vad.detected() {
-                self.speech_started = true;
-                self.last_partial_time = std::time::Instant::now();
-            }
-
             self.offset += self.window_size;
         }
     }
 
     pub fn is_speech_detected(&self) -> bool {
         self.vad.detected()
-    }
-
-    #[allow(dead_code)]
-    pub fn should_interim_decode(&mut self) -> bool {
-        self.speech_started
-            && self.last_partial_time.elapsed().as_secs_f32() > 0.2
-    }
-
-    #[allow(dead_code)]
-    pub fn reset_interim_timer(&mut self) {
-        self.last_partial_time = std::time::Instant::now();
     }
 
     pub fn try_get_segment(&mut self) -> Option<Vec<f32>> {
@@ -76,22 +57,54 @@ impl VoiceActivityDetector {
         None
     }
 
-    #[allow(dead_code)]
-    pub fn pending_window_start(&self) -> usize {
-        self.offset
-    }
-
-    #[allow(dead_code)]
-    pub fn trim_buffer(&mut self) {
-        if self.offset > 0 {
-            self.buffer = self.buffer[self.offset..].to_vec();
-            self.offset = 0;
-        }
-    }
-
     pub fn reset_after_segment(&mut self) {
         self.buffer.clear();
         self.offset = 0;
-        self.speech_started = false;
+    }
+
+    /// Current speech threshold (constructor value, raised by [`Self::calibrate`]).
+    pub fn threshold(&self) -> f32 {
+        self.threshold
+    }
+
+    /// Learn a speech threshold from background-noise calibration samples.
+    ///
+    /// Computes the RMS energy of `samples` and raises the threshold to
+    /// `rms * CALIBRATION_FACTOR` when that exceeds the current threshold;
+    /// the threshold never decreases, so calibrating on quiet audio is a
+    /// no-op. Factor 3.0 (~9.5 dB above the noise floor) is a common speech
+    /// margin. Clamped to 1.0 to stay a valid Silero probability threshold.
+    /// Standalone: callers decide when to calibrate (not wired into feed).
+    pub fn calibrate(&mut self, samples: &[f32]) {
+        self.threshold = learned_threshold(self.threshold, samples);
+    }
+}
+
+/// Pure RMS threshold-learning rule behind [`VoiceActivityDetector::calibrate`].
+fn learned_threshold(current: f32, samples: &[f32]) -> f32 {
+    if samples.is_empty() {
+        return current;
+    }
+    const CALIBRATION_FACTOR: f32 = 3.0;
+    let sum_sq: f32 = samples.iter().map(|s| s * s).sum();
+    let rms = (sum_sq / samples.len() as f32).sqrt();
+    current.max((rms * CALIBRATION_FACTOR).min(1.0))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn calibration_raises_threshold_on_loud_noise() {
+        // RMS of [0.1, -0.1, 0.1, -0.1] is ~0.1 -> ~0.1 * 3.0 = ~0.3.
+        let got = learned_threshold(0.05, &[0.1, -0.1, 0.1, -0.1]);
+        assert!((got - 0.3).abs() < 1e-6, "got {got}");
+    }
+
+    #[test]
+    fn calibration_never_lowers_threshold_and_ignores_empty() {
+        assert_eq!(learned_threshold(0.5, &[0.01, -0.01]), 0.5);
+        assert_eq!(learned_threshold(0.5, &[]), 0.5);
     }
 }

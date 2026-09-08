@@ -34,6 +34,8 @@ pub enum LlmProvider {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AppConfig {
     pub asr_profile: AsrProfile,
+    #[serde(default = "default_language")]
+    pub language: String,
     pub llm_provider: LlmProvider,
     #[serde(default)]
     pub llm_mode: LlmMode,
@@ -45,6 +47,10 @@ pub struct AppConfig {
     pub model_dir: PathBuf,
 }
 
+fn default_language() -> String {
+    "en".to_string()
+}
+
 impl Default for AppConfig {
     fn default() -> Self {
         let model_dir = dirs_next::data_dir()
@@ -54,6 +60,7 @@ impl Default for AppConfig {
 
         Self {
             asr_profile: AsrProfile::Parakeet,
+            language: default_language(),
             llm_provider: LlmProvider::Local,
             llm_mode: LlmMode::default(),
             selected_mic_index: None,
@@ -139,5 +146,43 @@ impl AppConfig {
         let json = serde_json::to_string_pretty(self)?;
         std::fs::write(&config_path, json)?;
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::AppConfig;
+
+    #[test]
+    fn language_defaults_to_en() {
+        assert_eq!(AppConfig::default().language, "en");
+    }
+
+    #[test]
+    fn old_config_without_language_loads_as_en() {
+        // Config files written before the `language` field existed must
+        // still parse, defaulting to English.
+        let old = serde_json::json!({
+            "asr_profile": "Parakeet",
+            "llm_provider": "Local",
+            "llm_mode": "Cleanup",
+            "selected_mic_index": null,
+            "typing_enabled": true,
+            "clipboard_enabled": true,
+            "dictation_mode": false,
+            "hotkey": "ctrl+shift+s",
+            "model_dir": "/tmp/models"
+        });
+        let config: AppConfig = serde_json::from_value(old).unwrap();
+        assert_eq!(config.language, "en");
+    }
+
+    #[test]
+    fn language_round_trips() {
+        let mut config = AppConfig::default();
+        config.language = "auto".to_string();
+        let json = serde_json::to_string(&config).unwrap();
+        let back: AppConfig = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.language, "auto");
     }
 }

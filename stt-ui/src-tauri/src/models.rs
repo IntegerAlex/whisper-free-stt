@@ -131,13 +131,40 @@ impl ModelManager {
     }
 }
 
+/// Stream an HTTP response body into `dest`, reporting progress as
+/// `(percent, downloaded_bytes)`. Shared by the archive and single-file
+/// branches of [`download_model`].
+async fn stream_to_file(
+    response: reqwest::Response,
+    dest: &Path,
+    total: u64,
+    progress: &mut impl FnMut(usize, u64),
+) -> Result<()> {
+    use futures_util::StreamExt;
+    use tokio::io::AsyncWriteExt;
+
+    let mut file = tokio::fs::File::create(dest).await?;
+    let mut downloaded: u64 = 0;
+
+    let mut stream = response.bytes_stream();
+    while let Some(chunk) = stream.next().await {
+        let chunk = chunk.map_err(|e| anyhow::anyhow!("Stream error: {}", e))?;
+        file.write_all(&chunk).await?;
+        downloaded += chunk.len() as u64;
+        let percent = (downloaded as f64 / total as f64 * 100.0) as usize;
+        progress(percent, downloaded);
+    }
+    file.flush().await?;
+    drop(file);
+
+    Ok(())
+}
+
 pub async fn download_model(
     model: &ModelManifest,
     target_dir: &Path,
     mut progress: impl FnMut(usize, u64),
 ) -> Result<()> {
-    use tokio::io::AsyncWriteExt;
-
     let url = model.url;
     let model_dir = target_dir;
 
@@ -158,20 +185,7 @@ pub async fn download_model(
 
     let (final_path, _is_archive) = if model.is_archive {
         let archive_path = model_dir.join("model.tar.bz2");
-        let mut file = tokio::fs::File::create(&archive_path).await?;
-        let mut downloaded: u64 = 0;
-
-        use futures_util::StreamExt;
-        let mut stream = response.bytes_stream();
-        while let Some(chunk) = stream.next().await {
-            let chunk = chunk.map_err(|e| anyhow::anyhow!("Stream error: {}", e))?;
-            file.write_all(&chunk).await?;
-            downloaded += chunk.len() as u64;
-            let percent = (downloaded as f64 / total as f64 * 100.0) as usize;
-            progress(percent, downloaded);
-        }
-        file.flush().await?;
-        drop(file);
+        stream_to_file(response, &archive_path, total, &mut progress).await?;
 
         let tar_bytes = std::fs::read(&archive_path)?;
         let decompressed = bzip2::read::BzDecoder::new(&tar_bytes[..]);
@@ -186,20 +200,7 @@ pub async fn download_model(
             .map(|f| f.to_string())
             .unwrap_or_else(|| format!("{}.{}", model.id, ext));
         let file_path = model_dir.join(&file_name);
-        let mut file = tokio::fs::File::create(&file_path).await?;
-        let mut downloaded: u64 = 0;
-
-        use futures_util::StreamExt;
-        let mut stream = response.bytes_stream();
-        while let Some(chunk) = stream.next().await {
-            let chunk = chunk.map_err(|e| anyhow::anyhow!("Stream error: {}", e))?;
-            file.write_all(&chunk).await?;
-            downloaded += chunk.len() as u64;
-            let percent = (downloaded as f64 / total as f64 * 100.0) as usize;
-            progress(percent, downloaded);
-        }
-        file.flush().await?;
-        drop(file);
+        stream_to_file(response, &file_path, total, &mut progress).await?;
 
         (file_path, false)
     };
