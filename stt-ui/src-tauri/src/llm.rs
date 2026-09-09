@@ -124,12 +124,16 @@ impl LlmCleanup {
 
         let local_model = if backend == LlmBackend::Local {
             if let Some(path) = model_path {
-                let model = LlamaModel::load_from_file(
-                    backend_handle.as_ref().unwrap(),
-                    path,
-                    &LlamaModelParams::default(),
-                )?;
-                Some(model)
+                if path.exists() {
+                    let model = LlamaModel::load_from_file(
+                        backend_handle.as_ref().unwrap(),
+                        path,
+                        &LlamaModelParams::default(),
+                    )?;
+                    Some(model)
+                } else {
+                    None
+                }
             } else {
                 None
             }

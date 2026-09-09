@@ -6,6 +6,7 @@ pub struct VoiceActivityDetector {
     buffer: Vec<f32>,
     offset: usize,
     window_size: usize,
+    #[allow(dead_code)]
     threshold: f32,
 }
 
@@ -43,6 +44,7 @@ impl VoiceActivityDetector {
         }
     }
 
+    #[allow(dead_code)]
     pub fn is_speech_detected(&self) -> bool {
         self.vad.detected()
     }
@@ -63,6 +65,7 @@ impl VoiceActivityDetector {
     }
 
     /// Current speech threshold (constructor value, raised by [`Self::calibrate`]).
+    #[allow(dead_code)]
     pub fn threshold(&self) -> f32 {
         self.threshold
     }
@@ -75,12 +78,14 @@ impl VoiceActivityDetector {
     /// no-op. Factor 3.0 (~9.5 dB above the noise floor) is a common speech
     /// margin. Clamped to 1.0 to stay a valid Silero probability threshold.
     /// Standalone: callers decide when to calibrate (not wired into feed).
+    #[allow(dead_code)]
     pub fn calibrate(&mut self, samples: &[f32]) {
         self.threshold = learned_threshold(self.threshold, samples);
     }
 }
 
 /// Pure RMS threshold-learning rule behind [`VoiceActivityDetector::calibrate`].
+#[allow(dead_code)]
 fn learned_threshold(current: f32, samples: &[f32]) -> f32 {
     if samples.is_empty() {
         return current;

@@ -853,9 +853,14 @@ async fn get_voice_intelligence() -> Result<VoiceIntelligenceData, AppError> {
 
 #[tauri::command]
 fn start_listening(app: tauri::AppHandle) -> Result<(), String> {
+    eprintln!("[backend] start_listening invoked");
     let config = AppConfig::load();
-    crate::pipeline::start_pipeline(app, config)
-        .map_err(|e| e.to_string())
+    let result = crate::pipeline::start_pipeline(app, config);
+    match &result {
+        Ok(_) => eprintln!("[backend] start_listening OK"),
+        Err(e) => eprintln!("[backend] start_listening FAILED: {}", e),
+    }
+    result.map_err(|e| e.to_string())
 }
 
 #[tauri::command]
@@ -995,6 +1000,7 @@ mod win32 {
 
     /// Send Ctrl+V using keybd_event — works from any GUI process with an
     /// active message loop (the Tauri app main thread).
+    #[allow(dead_code)]
     pub fn send_ctrl_v() {
         unsafe {
             keybd_event(VK_CONTROL, 0, 0, 0);
@@ -1048,6 +1054,7 @@ mod win32 {
     }
 
     /// Set clipboard content on Linux using wl-copy (Wayland) or xclip (X11).
+    #[allow(dead_code)]
     pub fn set_clipboard(text: &str) -> bool {
         let is_wayland = std::env::var("WAYLAND_DISPLAY").is_ok();
         if is_wayland {
@@ -1074,6 +1081,7 @@ mod win32 {
     }
 
     /// Simulate Ctrl+V paste on Linux.
+    #[allow(dead_code)]
     pub fn send_ctrl_v() {
         let is_wayland = std::env::var("WAYLAND_DISPLAY").is_ok();
         if is_wayland {
@@ -1105,7 +1113,7 @@ fn set_foreground_hwnd(hwnd: u64) -> bool {
 ///
 /// Flow: restore previous window focus → set clipboard via Win32 → send Ctrl+V via keybd_event
 #[tauri::command]
-fn type_text(text: String, restore_hwnd: Option<u64>) -> Result<bool, String> {
+fn type_text(text: String, _restore_hwnd: Option<u64>) -> Result<bool, String> {
     if text.trim().is_empty() {
         return Ok(false);
     }

@@ -39,6 +39,8 @@ pub struct AppConfig {
     pub llm_provider: LlmProvider,
     #[serde(default)]
     pub llm_mode: LlmMode,
+    #[serde(default = "default_llm_model")]
+    pub llm_model: String,
     pub selected_mic_index: Option<usize>,
     pub typing_enabled: bool,
     pub clipboard_enabled: bool,
@@ -49,6 +51,10 @@ pub struct AppConfig {
 
 fn default_language() -> String {
     "en".to_string()
+}
+
+fn default_llm_model() -> String {
+    "s1-mini-q4_k_m".to_string()
 }
 
 impl Default for AppConfig {
@@ -63,6 +69,7 @@ impl Default for AppConfig {
             language: default_language(),
             llm_provider: LlmProvider::Local,
             llm_mode: LlmMode::default(),
+            llm_model: default_llm_model(),
             selected_mic_index: None,
             typing_enabled: true,
             clipboard_enabled: true,

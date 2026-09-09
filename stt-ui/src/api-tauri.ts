@@ -11,6 +11,7 @@ interface TauriPayload {
   text?: string;
   backend?: string;
   latency_ms?: number;
+  error?: string;
 }
 
 // _cliArgs accepted for call-site compatibility (App/tests pass CLI args);
@@ -75,9 +76,15 @@ export function createTauriApi(_cliArgs?: string[]): STTApi {
       const events = [
         "asr_ready", "asr_partial", "asr_final",
         "llm_start", "llm_token", "llm_end",
+        "asr_error",
       ];
       for (const eventName of events) {
         const unlisten = await listen<TauriPayload>(eventName, (event) => {
+          if (eventName === "asr_error") {
+            console.error("[asr_error]", event.payload?.error ?? event.payload);
+            fail(event.payload?.error ?? "Unknown ASR error", event.payload);
+            return;
+          }
           handleEvent(eventName, event.payload ?? {});
         });
         unlistenFns.push(unlisten);

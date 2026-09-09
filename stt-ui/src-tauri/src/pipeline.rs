@@ -27,7 +27,19 @@ pub struct LlmProcessor {
 
 impl LlmProcessor {
     pub fn new(config: AppConfig) -> Self {
-        let llm_model_path = config.model_dir.join("gemma-3-1b-it-q4_k_m.gguf");
+        // Build the model path from the selected LLM model ID in config.
+        // The manifest's `filename` field is the on-disk name; fall back to
+        // the legacy gemma path if the model isn't in the manifest yet.
+        let filename = crate::models::find_model(&config.llm_model)
+            .and_then(|m| m.filename)
+            .unwrap_or("s1-mini-q4_k_m.gguf");
+        let llm_model_path = config.model_dir.join(&config.llm_model).join(filename);
+        // Legacy fallback: check the old flat path before the subdirectory layout
+        let llm_model_path = if llm_model_path.exists() {
+            llm_model_path
+        } else {
+            config.model_dir.join(filename)
+        };
         let llm = match LlmCleanup::new(LlmBackend::Local, Some(&llm_model_path)) {
             Ok(l) => Some(l),
             Err(_) => None,
@@ -82,7 +94,7 @@ pub struct PipelineController {
     app: tauri::AppHandle,
     config: AppConfig,
     silero_path: PathBuf,
-    model_dir: PathBuf,
+    _model_dir: PathBuf,
 }
 
 impl PipelineController {
@@ -90,19 +102,35 @@ impl PipelineController {
         let running = get_running_flag().clone();
         let model_dir = config.model_dir.clone();
         let silero_path = model_dir.join("silero-vad").join("silero_vad.onnx");
+        let vad_manifest = MODEL_MANIFEST
+            .iter()
+            .find(|m| m.id == "silero-vad")
+            .unwrap();
 
-        if !silero_path.exists() {
+        // Use verify_model (existence + exact size) rather than `exists()`:
+        // a stale/truncated file from an old broken download would crash
+        // sherpa-onnx at VAD creation with an uncaught C++ exception.
+        let silero_valid = verify_model(&model_dir, vad_manifest);
+
+        eprintln!(
+            "[pipeline] model_dir={:?} profile={:?} silero_valid={}",
+            model_dir,
+            config.asr_profile,
+            silero_valid
+        );
+
+        if !silero_valid {
+            if silero_path.exists() {
+                std::fs::remove_file(&silero_path)?;
+                eprintln!("[pipeline] removed invalid silero VAD file, re-downloading");
+            }
             std::fs::create_dir_all(&model_dir.join("silero-vad"))?;
             let model_dir_dl = model_dir.join("silero-vad");
-            let vad_model = MODEL_MANIFEST
-                .iter()
-                .find(|m| m.id == "silero-vad")
-                .unwrap();
             let runtime = tokio::runtime::Builder::new_current_thread()
                 .enable_all()
                 .build()?;
             let result = runtime.block_on(async {
-                download_model(vad_model, &model_dir_dl, |_, _| {}).await
+                download_model(vad_manifest, &model_dir_dl, |_, _| {}).await
             });
             if let Err(e) = result {
                 let _ = app.emit(
@@ -114,7 +142,7 @@ impl PipelineController {
             }
         }
 
-        if !silero_path.exists() {
+        if !verify_model(&model_dir, vad_manifest) {
             let _ = app.emit(
                 "asr_error",
                 serde_json::json!({"error": "Silero VAD model file not found after download attempt"}),
@@ -131,9 +159,15 @@ impl PipelineController {
             .iter()
             .find(|m| m.id == asr_model_id)
             .ok_or_else(|| anyhow::anyhow!("Unknown ASR model: {}", asr_model_id))?;
+        eprintln!(
+            "[pipeline] ASR model: {} (exists={})",
+            asr_model_id,
+            verify_model(&model_dir, asr_manifest)
+        );
         if !verify_model(&model_dir, asr_manifest) {
             let asr_dir = config.asr_profile.model_dir(&model_dir);
             std::fs::create_dir_all(&asr_dir)?;
+            eprintln!("[pipeline] downloading ASR model {} to {}", asr_model_id, asr_dir.display());
             let runtime = tokio::runtime::Builder::new_current_thread()
                 .enable_all()
                 .build()?;
@@ -141,12 +175,13 @@ impl PipelineController {
                 download_model(asr_manifest, &asr_dir, |_, _| {}).await
             });
             if let Err(e) = result {
+                eprintln!("[pipeline] ASR model download FAILED: {}", e);
                 let _ = app.emit(
                     "asr_error",
                     serde_json::json!({"error": format!("Failed to download ASR model: {}", e)}),
                 );
                 running.store(false, Ordering::SeqCst);
-                return Err(anyhow::anyhow!("ASR model download failed"));
+                return Err(anyhow::anyhow!("ASR model download failed: {}", e));
             }
             if !verify_model(&model_dir, asr_manifest) {
                 let _ = app.emit(
@@ -156,6 +191,7 @@ impl PipelineController {
                 running.store(false, Ordering::SeqCst);
                 return Err(anyhow::anyhow!("ASR model not found"));
             }
+            eprintln!("[pipeline] ASR model {} ready", asr_model_id);
         }
 
         Ok(Self {
@@ -163,7 +199,7 @@ impl PipelineController {
             app,
             config,
             silero_path,
-            model_dir,
+            _model_dir: model_dir,
         })
     }
 
@@ -280,47 +316,26 @@ impl PipelineController {
 
                         vad.feed(&resampled);
 
-                        if vad.is_speech_detected() {
-                            if let Some(ref mut rec) = parakeet {
-                                rec.accept(&resampled);
-
-                                if let Some(partial) = rec.get_partial() {
-                                    let _ = app_clone.emit(
-                                        "asr_partial",
-                                        serde_json::json!({ "text": partial }),
-                                    );
-                                }
-
-                                if rec.is_endpoint() {
-                                    if let Some(final_text) = rec.get_partial() {
-                                        let _ = app_clone.emit(
-                                            "asr_final",
-                                            serde_json::json!({ "text": final_text }),
-                                        );
-                                        llm_processor.process(&final_text, &app_clone);
-                                        rec.reset();
-                                    }
-                                    vad.reset_after_segment();
-                                }
-                            }
-                        }
-
                         if let Some(segment) = vad.try_get_segment() {
-                            if let Some(ref ws) = whisper {
-                                let start = Instant::now();
-                                let text = ws.transcribe(&segment);
-                                let latency_ms = start.elapsed().as_millis() as u64;
+                            let start = Instant::now();
+                            let text = if let Some(ref rec) = parakeet {
+                                rec.transcribe(&segment)
+                            } else if let Some(ref ws) = whisper {
+                                ws.transcribe(&segment)
+                            } else {
+                                String::new()
+                            };
+                            let latency_ms = start.elapsed().as_millis() as u64;
 
-                                if !text.is_empty() {
-                                    let _ = app_clone.emit(
-                                        "asr_final",
-                                        serde_json::json!({
-                                            "text": text,
-                                            "latency_ms": latency_ms,
-                                        }),
-                                    );
-                                    llm_processor.process(&text, &app_clone);
-                                }
+                            if !text.is_empty() {
+                                let _ = app_clone.emit(
+                                    "asr_final",
+                                    serde_json::json!({
+                                        "text": text,
+                                        "latency_ms": latency_ms,
+                                    }),
+                                );
+                                llm_processor.process(&text, &app_clone);
                             }
                             vad.reset_after_segment();
                         }
@@ -334,6 +349,7 @@ impl PipelineController {
         Ok(())
     }
 
+    #[allow(dead_code)]
     pub fn stop(&self) {
         if let Some(flag) = PIPELINE_RUNNING.get() {
             flag.store(false, Ordering::SeqCst);

@@ -15,6 +15,7 @@ export interface ModelStatusEntry {
 }
 
 interface RustModelStatus {
+  id: string;
   name: string;
   downloaded: boolean;
   path: string;
@@ -53,7 +54,6 @@ export function useModels() {
 
       setModels((prev) =>
         prev.map((m) => {
-          // Match by name across catalog entries
           const status = rustStatuses.find((s) => s.name === m.name);
           if (status) {
             return {
@@ -83,6 +83,12 @@ export function useModels() {
       return;
     }
 
+    const entry = MODEL_CATALOG.find((m) => m.name === modelName);
+    if (!entry) {
+      setGlobalError(`Model "${modelName}" not found in catalog`);
+      return;
+    }
+
     setModels((prev) =>
       prev.map((m) =>
         m.name === modelName
@@ -92,42 +98,34 @@ export function useModels() {
     );
 
     try {
-      const { Command } = await import("@tauri-apps/plugin-shell");
-      const cmd = Command.sidecar("binaries/stt-engine", [
-        "--json-mode",
-        "--model", modelName,
-        "--asr-profile", "speed",
-        "--llm-mode", "off",
-        "--input-file", "/dev/null",
-      ]);
+      const { invoke } = await import("@tauri-apps/api/core");
+      await invoke("download_model", { id: entry.id });
 
-      let lastProgress = 0;
-      cmd.stdout.on("data", (line: string) => {
-        // Parse download progress from stdout
-        const downloadMatch = line.match(/Downloading.*?(\d+)%/i) || line.match(/(\d+)%/);
-        if (downloadMatch) {
-          lastProgress = parseInt(downloadMatch[1], 10);
-          setModels((prev) =>
-            prev.map((m) =>
-              m.name === modelName
-                ? { ...m, progress: lastProgress }
-                : m
-            )
-          );
+      // Poll check_model_status until the model appears downloaded.
+      // download_model is fire-and-forget; polling is the only way to
+      // know when it finishes.
+      const poll = setInterval(async () => {
+        try {
+          const statuses = await invoke<RustModelStatus[]>("check_model_status");
+          const status = statuses.find((s) => s.id === entry.id);
+          if (status?.downloaded) {
+            if (pollingRef.current) clearInterval(pollingRef.current);
+            pollingRef.current = null;
+            setModels((prev) =>
+              prev.map((m) =>
+                m.name === modelName
+                  ? { ...m, downloading: false, progress: 100 }
+                  : m
+              )
+            );
+            await refreshModels();
+          }
+        } catch {
+          /* retry next tick */
         }
-      });
+      }, 2000);
 
-      await cmd.execute();
-
-      // Mark as done and refresh actual disk status
-      setModels((prev) =>
-        prev.map((m) =>
-          m.name === modelName
-            ? { ...m, downloading: false, progress: 100 }
-            : m
-        )
-      );
-      await refreshModels();
+      pollingRef.current = poll;
     } catch (err) {
       setModels((prev) =>
         prev.map((m) =>
@@ -146,23 +144,11 @@ export function useModels() {
     if (!model || !model.downloaded || !model.path) return;
 
     try {
-      const { Command } = await import("@tauri-apps/plugin-shell");
-      await Command.sidecar("binaries/stt-engine", [
-        "--json-mode",
-        "--delete-model", modelName,
-        "--llm-mode", "off",
-        "--input-file", "/dev/null",
-      ]).execute();
+      const { invoke: invokeCmd } = await import("@tauri-apps/api/core");
+      await invokeCmd("delete_model_file", { path: model.path });
       await refreshModels();
     } catch {
-      // Fallback: try direct removal via Rust
-      try {
-        const { invoke: invokeCmd } = await import("@tauri-apps/api/core");
-        await invokeCmd("delete_model_file", { path: model.path });
-        await refreshModels();
-      } catch {
-        setGlobalError(`Failed to delete ${modelName}`);
-      }
+      setGlobalError(`Failed to delete ${modelName}`);
     }
   }, [models, refreshModels]);
 

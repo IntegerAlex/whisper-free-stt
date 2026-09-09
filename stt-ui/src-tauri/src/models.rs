@@ -18,8 +18,8 @@ pub const MODEL_MANIFEST: &[ModelManifest] = &[
     ModelManifest {
         id: "silero-vad",
         name: "Silero VAD",
-        url: "https://github.com/k2-fsa/sherpa-onnx/releases/download/vad-models/silero_vad.onnx",
-        size_bytes: 1_000_000,
+        url: "https://github.com/k2-fsa/sherpa-onnx/releases/download/asr-models/silero_vad.onnx",
+        size_bytes: 643_854,
         backend: "vad",
         recommended: true,
         is_archive: false,
@@ -28,8 +28,8 @@ pub const MODEL_MANIFEST: &[ModelManifest] = &[
     ModelManifest {
         id: "parakeet-tdt-0.6b-v2-int8",
         name: "Parakeet TDT 0.6B v2 (int8)",
-        url: "https://github.com/k2-fsa/sherpa-onnx/releases/download/asr-models/sherpa-onnx-nemo-parakeet-tdt-0.6b-v2-int8-2025-01-29.tar.bz2",
-        size_bytes: 1_000_000_000,
+        url: "https://github.com/k2-fsa/sherpa-onnx/releases/download/asr-models/sherpa-onnx-nemo-parakeet-tdt-0.6b-v2-int8.tar.bz2",
+        size_bytes: 482_468_385,
         backend: "parakeet",
         recommended: true,
         is_archive: true,
@@ -38,8 +38,8 @@ pub const MODEL_MANIFEST: &[ModelManifest] = &[
     ModelManifest {
         id: "whisper-large-v3-turbo-q5_1",
         name: "Whisper large-v3-turbo (Q5_1)",
-        url: "https://github.com/k2-fsa/sherpa-onnx/releases/download/asr-models/sherpa-onnx-whisper-large-v3-turbo-q5_1-2024-11-20.tar.bz2",
-        size_bytes: 6_000_000_000,
+        url: "https://github.com/k2-fsa/sherpa-onnx/releases/download/asr-models/sherpa-onnx-whisper-turbo.tar.bz2",
+        size_bytes: 563_790_207,
         backend: "whisper",
         recommended: false,
         is_archive: true,
@@ -48,20 +48,30 @@ pub const MODEL_MANIFEST: &[ModelManifest] = &[
     ModelManifest {
         id: "whisper-base-q5_1",
         name: "Whisper base (Q5_1)",
-        url: "https://github.com/k2-fsa/sherpa-onnx/releases/download/asr-models/sherpa-onnx-whisper-base-q5_1-2024-11-20.tar.bz2",
-        size_bytes: 750_000_000,
+        url: "https://github.com/k2-fsa/sherpa-onnx/releases/download/asr-models/sherpa-onnx-whisper-base.tar.bz2",
+        size_bytes: 207_557_382,
         backend: "whisper",
         recommended: false,
         is_archive: true,
         filename: None,
     },
     ModelManifest {
-        id: "gemma-3-1b-it-q4_k_m",
-        name: "Gemma 3 1B IT (Q4_K_M)",
-        url: "https://huggingface.co/unsloth/gemma-3-1b-it-gguf/resolve/main/gemma-3-1b-it-q4_k_m.gguf",
-        size_bytes: 500_000_000,
+        id: "s1-mini-q4_k_m",
+        name: "S1-Mini Q4_K_M",
+        url: "https://huggingface.co/superwhisper/s1-mini-GGUF/resolve/main/s1-mini-q4_k_m.gguf",
+        size_bytes: 484_219_808,
         backend: "llm",
         recommended: true,
+        is_archive: false,
+        filename: Some("s1-mini-q4_k_m.gguf"),
+    },
+    ModelManifest {
+        id: "gemma-3-1b-it-q4_k_m",
+        name: "Gemma 3 1B IT (Q4_K_M)",
+        url: "https://huggingface.co/unsloth/gemma-3-1b-it-GGUF/resolve/main/gemma-3-1b-it-Q4_K_M.gguf",
+        size_bytes: 806_058_272,
+        backend: "llm",
+        recommended: false,
         is_archive: false,
         filename: Some("gemma-3-1b-it-q4_k_m.gguf"),
     },
@@ -124,7 +134,8 @@ impl ModelManager {
     pub async fn download(&self, id: &str, mut progress: impl FnMut(usize, u64)) -> Result<()> {
         let model_opt = find_model(id);
         if let Some(model) = model_opt {
-            download_model(model, &self.model_dir, |p, b| progress(p, b)).await
+            let target_dir = self.model_dir.join(model.id);
+            download_model(model, &target_dir, |p, b| progress(p, b)).await
         } else {
             Err(anyhow::anyhow!("Model not found: {}", id))
         }
@@ -133,17 +144,23 @@ impl ModelManager {
 
 /// Stream an HTTP response body into `dest`, reporting progress as
 /// `(percent, downloaded_bytes)`. Shared by the archive and single-file
-/// branches of [`download_model`].
+/// branches of [`download_model`]. When `resume_offset > 0` the file is
+/// opened in append mode so an interrupted download can be continued.
 async fn stream_to_file(
     response: reqwest::Response,
     dest: &Path,
-    total: u64,
+    expected_total: u64,
+    resume_offset: u64,
     progress: &mut impl FnMut(usize, u64),
-) -> Result<()> {
+) -> Result<u64> {
     use futures_util::StreamExt;
     use tokio::io::AsyncWriteExt;
 
-    let mut file = tokio::fs::File::create(dest).await?;
+    let mut file = if resume_offset > 0 {
+        tokio::fs::OpenOptions::new().append(true).create(true).open(dest).await?
+    } else {
+        tokio::fs::File::create(dest).await?
+    };
     let mut downloaded: u64 = 0;
 
     let mut stream = response.bytes_stream();
@@ -151,12 +168,133 @@ async fn stream_to_file(
         let chunk = chunk.map_err(|e| anyhow::anyhow!("Stream error: {}", e))?;
         file.write_all(&chunk).await?;
         downloaded += chunk.len() as u64;
-        let percent = (downloaded as f64 / total as f64 * 100.0) as usize;
-        progress(percent, downloaded);
+        let total_so_far = resume_offset + downloaded;
+        let percent = if expected_total > 0 {
+            (total_so_far as f64 / expected_total as f64 * 100.0) as usize
+        } else {
+            100
+        };
+        progress(percent, total_so_far);
     }
     file.flush().await?;
     drop(file);
 
+    Ok(downloaded)
+}
+
+/// Move the contents of a single top-level folder up into `model_dir`.
+/// The sherpa-onnx release archives unpack into one nested directory
+/// (e.g. `sherpa-onnx-nemo-parakeet-tdt-0.6b-v2-int8/`), but the
+/// recognizers expect a flat layout inside the model dir.
+fn hoist_single_subdir(model_dir: &Path) -> Result<()> {
+    let dirs: Vec<PathBuf> = std::fs::read_dir(model_dir)?
+        .filter_map(|e| e.ok())
+        .map(|e| e.path())
+        .filter(|p| p.is_dir())
+        .filter(|p| p.file_name().map(|n| n != ".downloaded").unwrap_or(true))
+        .collect();
+    if dirs.len() == 1 {
+        let inner = &dirs[0];
+        for entry in std::fs::read_dir(inner)? {
+            let entry = entry?;
+            let dest = model_dir.join(entry.file_name());
+            if dest.exists() {
+                if dest.is_dir() {
+                    std::fs::remove_dir_all(&dest)?;
+                } else {
+                    std::fs::remove_file(&dest)?;
+                }
+            }
+            std::fs::rename(entry.path(), dest)?;
+        }
+        std::fs::remove_dir(inner)?;
+        eprintln!("[models] hoisted single archive folder -> {}", model_dir.display());
+    }
+    Ok(())
+}
+
+/// Whisper archives name their files `<model>-encoder[.int8].onnx`,
+/// `<model>-decoder[.int8].onnx` and `<model>-tokens.txt`. Return the
+/// path of the best matching file, preferring the int8 variant when both
+/// float32 and int8 are shipped in the same archive.
+fn pick_whisper_file(model_dir: &Path, kind: &str) -> Result<PathBuf> {
+    let suffixes: &[&str] = match kind {
+        "encoder" => &["-encoder.int8.onnx", "-encoder.onnx"],
+        "decoder" => &["-decoder.int8.onnx", "-decoder.onnx"],
+        "tokens" => &["-tokens.txt"],
+        _ => unreachable!("pick_whisper_file: unknown kind"),
+    };
+    let files: Vec<PathBuf> = std::fs::read_dir(model_dir)?
+        .filter_map(|e| e.ok())
+        .map(|e| e.path())
+        .filter(|p| p.is_file())
+        .filter(|p| {
+            let name = p.file_name().unwrap().to_string_lossy();
+            suffixes.iter().any(|s| name.ends_with(s))
+        })
+        .collect();
+    if files.is_empty() {
+        return Err(anyhow::anyhow!(
+            "Whisper {} file not found in archive dir {}",
+            kind,
+            model_dir.display()
+        ));
+    }
+    Ok(files
+        .into_iter()
+        .min_by_key(|p| {
+            let name = p.file_name().unwrap().to_string_lossy();
+            if name.contains(".int8.") { 0 } else { 1 }
+        })
+        .unwrap())
+}
+
+/// Rename archive files to the flat, canonical layout that `verify_model`
+/// and the recognizers expect:
+/// - parakeet: `encoder.int8.onnx` -> `encoder.onnx`, etc.
+/// - whisper: `<m>-encoder[.int8].onnx` -> `whisper-encoder.onnx`,
+///   `<m>-decoder[.int8].onnx` -> `whisper-decoder.onnx`,
+///   `<m>-tokens.txt` -> `tokens.txt`
+fn normalize_extracted(backend: &str, model_dir: &Path) -> Result<()> {
+    hoist_single_subdir(model_dir)?;
+
+    match backend {
+        "parakeet" => {
+            for name in ["encoder", "decoder", "joiner"] {
+                let int8 = model_dir.join(format!("{name}.int8.onnx"));
+                let plain = model_dir.join(format!("{name}.onnx"));
+                if int8.exists() && !plain.exists() {
+                    eprintln!("[models] rename {}.int8.onnx -> {}.onnx", name, name);
+                    std::fs::rename(&int8, &plain)?;
+                } else if int8.exists() && plain.exists() {
+                    std::fs::remove_file(&int8)?;
+                }
+            }
+        }
+        "whisper" => {
+            let encoder = pick_whisper_file(model_dir, "encoder")?;
+            let decoder = pick_whisper_file(model_dir, "decoder")?;
+            let tokens = pick_whisper_file(model_dir, "tokens")?;
+            for (src, dest_name) in [
+                (encoder, "whisper-encoder.onnx"),
+                (decoder, "whisper-decoder.onnx"),
+                (tokens, "tokens.txt"),
+            ] {
+                let dest = model_dir.join(dest_name);
+                if dest.exists() {
+                    std::fs::remove_file(&src)?;
+                } else {
+                    eprintln!(
+                        "[models] rename {} -> {}",
+                        src.file_name().unwrap().to_string_lossy(),
+                        dest_name
+                    );
+                    std::fs::rename(src, dest)?;
+                }
+            }
+        }
+        _ => {}
+    }
     Ok(())
 }
 
@@ -169,44 +307,153 @@ pub async fn download_model(
     let model_dir = target_dir;
 
     if model_dir.join(".downloaded").exists() {
+        eprintln!("[models] {} already downloaded, skipping", model.id);
         return Ok(());
     }
 
+    eprintln!(
+        "[models] downloading {} -> {} ({} bytes, archive={})",
+        model.id,
+        model_dir.display(),
+        model.size_bytes,
+        model.is_archive
+    );
+
     std::fs::create_dir_all(model_dir)?;
 
-    let client = reqwest::Client::new();
-    let response = client
-        .get(url)
-        .send()
-        .await
-        .map_err(|e| anyhow::anyhow!("Failed to start download: {}", e))?;
-
-    let total = response.content_length().unwrap_or(model.size_bytes);
-
-    let (final_path, _is_archive) = if model.is_archive {
-        let archive_path = model_dir.join("model.tar.bz2");
-        stream_to_file(response, &archive_path, total, &mut progress).await?;
-
-        let tar_bytes = std::fs::read(&archive_path)?;
-        let decompressed = bzip2::read::BzDecoder::new(&tar_bytes[..]);
-        let mut archive = tar::Archive::new(decompressed);
-        archive.unpack(model_dir)?;
-        std::fs::remove_file(&archive_path)?;
-
-        (model_dir.to_path_buf(), true)
+    // If a previous attempt left a partial file behind (e.g. the app was
+    // interrupted mid-download), resume from where it stopped by issuing a
+    // Range request, instead of re-downloading the whole model from zero.
+    let ext = url.rsplit('.').next().unwrap_or("bin");
+    let resume_file: PathBuf = if model.is_archive {
+        model_dir.join("model.tar.bz2")
     } else {
-        let ext = model.url.rsplit('.').next().unwrap_or("bin");
         let file_name: String = model.filename
             .map(|f| f.to_string())
             .unwrap_or_else(|| format!("{}.{}", model.id, ext));
-        let file_path = model_dir.join(&file_name);
-        stream_to_file(response, &file_path, total, &mut progress).await?;
-
-        (file_path, false)
+        model_dir.join(&file_name)
     };
+    let resume_offset = std::fs::metadata(&resume_file)
+        .map(|m| m.len())
+        .unwrap_or(0);
 
-    let _ = (final_path, _is_archive);
+    let expected_total = model.size_bytes;
+
+    // If the payload is already fully on disk, skip the network entirely —
+    // this happens when a previous run finished downloading but was killed
+    // before extraction, or when the user dropped the archive in manually.
+    let payload_complete = resume_offset > 0 && resume_offset >= expected_total;
+    if payload_complete {
+        eprintln!(
+            "[models] {} payload already on disk at full size ({} bytes), skipping download",
+            model.id, resume_offset
+        );
+    } else {
+        let mut request = reqwest::Client::new().get(url);
+        if resume_offset > 0 {
+            eprintln!(
+                "[models] {} partial file found ({} bytes), resuming download",
+                model.id, resume_offset
+            );
+            request = request.header(
+                reqwest::header::RANGE,
+                format!("bytes={}-", resume_offset),
+            );
+        }
+
+        let response = request
+            .send()
+            .await
+            .map_err(|e| anyhow::anyhow!("Failed to start download of {}: {}", url, e))?;
+
+        // 416 Range Not Satisfiable means the requested range starts at or
+        // past the end of the file — i.e. the payload is already complete.
+        if response.status() == reqwest::StatusCode::RANGE_NOT_SATISFIABLE {
+            eprintln!(
+                "[models] {} server reports range not satisfiable; file already complete",
+                model.id
+            );
+        } else if !response.status().is_success() {
+            return Err(anyhow::anyhow!(
+                "Download of {} returned HTTP {}",
+                url,
+                response.status()
+            ));
+        } else {
+            // A 206 partial-content response honors our Range header and its
+            // content-length counts from the resume offset; otherwise the
+            // server ignored the range and we restart from the beginning.
+            let is_partial = response.status() == reqwest::StatusCode::PARTIAL_CONTENT;
+            let content_len = response.content_length()
+                .unwrap_or(expected_total.saturating_sub(resume_offset));
+            let total = resume_offset + content_len;
+            let effective_offset = if is_partial { resume_offset } else { 0 };
+            if resume_offset > 0 && !is_partial {
+                eprintln!(
+                    "[models] {} server ignored Range request, re-downloading from 0",
+                    model.id
+                );
+            }
+
+            eprintln!(
+                "[models] {} download started, content-length={:?} (HTTP {}), offset={}",
+                model.id,
+                response.content_length(),
+                response.status(),
+                effective_offset
+            );
+
+            // Log progress to stderr every 10% even when the caller's progress
+            // callback is a no-op, so the terminal shows the download is alive.
+            let mut last_pct: usize = 0;
+            let mut on_progress = |percent: usize, bytes: u64| {
+                if percent >= last_pct + 10 || percent <= 1 {
+                    last_pct = percent;
+                    eprintln!("[models] {} download: {}% ({} bytes)", model.id, percent, bytes);
+                }
+                progress(percent, bytes);
+            };
+
+            let downloaded = stream_to_file(
+                response,
+                &resume_file,
+                total,
+                effective_offset,
+                &mut on_progress,
+            )
+            .await?;
+
+            if effective_offset + downloaded != total {
+                return Err(anyhow::anyhow!(
+                    "{} download incomplete: {} of {} bytes ({})",
+                    model.id,
+                    effective_offset + downloaded,
+                    total,
+                    resume_file.display()
+                ));
+            }
+        }
+    }
+
+    // Extract / finalize — shared by the fresh-download, resumed and
+    // already-on-disk paths.
+    if model.is_archive {
+        eprintln!("[models] {} archive saved, extracting...", model.id);
+        let tar_bytes = std::fs::read(&resume_file)?;
+        let decompressed = bzip2::read::BzDecoder::new(&tar_bytes[..]);
+        let mut archive = tar::Archive::new(decompressed);
+        archive.unpack(model_dir).map_err(|e| {
+            anyhow::anyhow!("Failed to extract {} archive: {}", model.id, e)
+        })?;
+        std::fs::remove_file(&resume_file)?;
+
+        normalize_extracted(model.backend, model_dir)?;
+    } else {
+        eprintln!("[models] {} file saved -> {}", model.id, resume_file.display());
+    }
+
     std::fs::write(model_dir.join(".downloaded"), b"")?;
+    eprintln!("[models] {} download complete -> {}", model.id, model_dir.display());
 
     Ok(())
 }
@@ -219,7 +466,13 @@ pub fn verify_model(models_dir: &Path, model: &ModelManifest) -> bool {
 
     match model.backend {
         "vad" => {
-            model_dir.join("silero_vad.onnx").exists()
+            // Size check guards against a stale/truncated file (e.g. a 404
+            // body saved by an old broken download): such a file passes
+            // `exists()` but makes sherpa-onnx throw a C++ exception at
+            // VAD creation, which aborts the process.
+            model_dir.join("silero_vad.onnx").metadata()
+                .map(|m| m.len() == model.size_bytes)
+                .unwrap_or(false)
         }
         "parakeet" => {
             model_dir.join("encoder.onnx").exists()
@@ -230,7 +483,7 @@ pub fn verify_model(models_dir: &Path, model: &ModelManifest) -> bool {
         "whisper" => {
             model_dir.join("whisper-encoder.onnx").exists()
                 && model_dir.join("whisper-decoder.onnx").exists()
-                && model_dir.join("vocabulary.json").exists()
+                && model_dir.join("tokens.txt").exists()
         }
         "llm" => {
             model_dir.join(format!("{}.gguf", model.id)).exists()

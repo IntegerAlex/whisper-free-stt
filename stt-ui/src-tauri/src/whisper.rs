@@ -29,7 +29,7 @@ fn build_recognizer(
 ) -> Result<OfflineRecognizer> {
     let encoder = model_dir.join("whisper-encoder.onnx");
     let decoder = model_dir.join("whisper-decoder.onnx");
-    let tokens = model_dir.join("vocabulary.json");
+    let tokens = model_dir.join("tokens.txt");
 
     let mut config = OfflineRecognizerConfig::default();
     config.model_config.whisper.encoder = Some(encoder.to_str().unwrap().into());
@@ -80,6 +80,7 @@ impl WhisperRecognizer {
         }
     }
 
+    #[allow(dead_code)]
     pub fn language(&self) -> Option<&str> {
         self.language.as_deref()
     }

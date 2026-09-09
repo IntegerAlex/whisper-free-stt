@@ -1,9 +1,8 @@
 use anyhow::Result;
-use sherpa_onnx::{OnlineRecognizer, OnlineRecognizerConfig, OnlineStream};
+use sherpa_onnx::{OfflineRecognizer, OfflineRecognizerConfig};
 
 pub struct ParakeetRecognizer {
-    recognizer: OnlineRecognizer,
-    stream: OnlineStream,
+    recognizer: OfflineRecognizer,
 }
 
 impl ParakeetRecognizer {
@@ -13,7 +12,7 @@ impl ParakeetRecognizer {
         let joiner = model_dir.join("joiner.onnx");
         let tokens = model_dir.join("tokens.txt");
 
-        let mut config = OnlineRecognizerConfig::default();
+        let mut config = OfflineRecognizerConfig::default();
         config.model_config.transducer.encoder = Some(encoder.to_str().unwrap().into());
         config.model_config.transducer.decoder = Some(decoder.to_str().unwrap().into());
         config.model_config.transducer.joiner = Some(joiner.to_str().unwrap().into());
@@ -22,35 +21,22 @@ impl ParakeetRecognizer {
         config.model_config.num_threads = num_threads;
         config.model_config.debug = debug;
 
-        config.enable_endpoint = true;
-        config.rule1_min_trailing_silence = 2.4;
-        config.rule2_min_trailing_silence = 1.2;
-        config.rule3_min_utterance_length = 20.0;
         config.decoding_method = Some("greedy_search".to_string());
 
-        let recognizer = OnlineRecognizer::create(&config)
-            .ok_or_else(|| anyhow::anyhow!("Failed to create Parakeet OnlineRecognizer"))?;
-        let stream = recognizer.create_stream();
+        let recognizer = OfflineRecognizer::create(&config)
+            .ok_or_else(|| anyhow::anyhow!("Failed to create Parakeet OfflineRecognizer"))?;
 
-        Ok(Self { recognizer, stream })
+        Ok(Self { recognizer })
     }
 
-    pub fn accept(&mut self, samples: &[f32]) {
-        self.stream.accept_waveform(16000, samples);
-        while self.recognizer.is_ready(&self.stream) {
-            self.recognizer.decode(&self.stream);
-        }
-    }
-
-    pub fn get_partial(&self) -> Option<String> {
-        self.recognizer.get_result(&self.stream).map(|r| r.text)
-    }
-
-    pub fn is_endpoint(&self) -> bool {
-        self.recognizer.is_endpoint(&self.stream)
-    }
-
-    pub fn reset(&self) {
-        self.recognizer.reset(&self.stream);
+    /// Transcribe a complete audio segment (e.g. a VAD speech segment).
+    pub fn transcribe(&self, samples: &[f32]) -> String {
+        let stream = self.recognizer.create_stream();
+        stream.accept_waveform(16000, samples);
+        self.recognizer.decode(&stream);
+        stream
+            .get_result()
+            .map(|r| r.text)
+            .unwrap_or_default()
     }
 }
