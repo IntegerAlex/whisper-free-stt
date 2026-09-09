@@ -734,8 +734,8 @@ describe("Sidebar", () => {
 describe("SettingsPanel", () => {
   const defaultSettings: RuntimeSettings = {
     wsPort: 8765,
-    asrProfile: "distil",
-    backend: "auto",
+    asrProfile: "auto",
+    backend: "sherpa_onnx",
     model: "",
     llmMode: "cleanup",
     llmProvider: "openrouter",
@@ -1343,9 +1343,11 @@ describe("DEFAULT_ONBOARDING", () => {
     expect(DEFAULT_ONBOARDING.systemChecks).toEqual([]);
     expect(DEFAULT_ONBOARDING.selectedMicIndex).toBeNull();
     expect(DEFAULT_ONBOARDING.micLevel).toBe(0);
-    expect(DEFAULT_ONBOARDING.clipboardEnabled).toBe(false);
-    expect(DEFAULT_ONBOARDING.typingEnabled).toBe(false);
-    expect(DEFAULT_ONBOARDING.preferredModel).toBe("small.en");
+    expect(DEFAULT_ONBOARDING.clipboardEnabled).toBe(true);
+    expect(DEFAULT_ONBOARDING.typingEnabled).toBe(true);
+    expect(DEFAULT_ONBOARDING.preferredModel).toBe("parakeet-tdt-0.6b-v2-int8");
+    expect(DEFAULT_ONBOARDING.preferredLLMBackend).toBe("local");
+    expect(DEFAULT_ONBOARDING.llmMode).toBe("cleanup");
     expect(DEFAULT_ONBOARDING.error).toBeNull();
   });
 });
@@ -1354,8 +1356,8 @@ describe("DEFAULT_ONBOARDING", () => {
 // 34. Store: MODEL_CATALOG
 // ══════════════════════════════════════════════════════════════════
 describe("MODEL_CATALOG", () => {
-  it("has 5 models", () => {
-    expect(MODEL_CATALOG.length).toBe(5);
+  it("has 3 models", () => {
+    expect(MODEL_CATALOG.length).toBe(3);
   });
 
   it("each model has required fields", () => {
@@ -1366,15 +1368,14 @@ describe("MODEL_CATALOG", () => {
       expect(model.speed).toBeTruthy();
       expect(model.accuracy).toBeTruthy();
       expect(model.bestFor).toBeTruthy();
-      expect(["whisper_cpp", "faster_whisper"]).toContain(model.backend);
+      expect(["sherpa_onnx"]).toContain(model.backend);
       expect(model.profile).toBeTruthy();
     }
   });
 
-  it("models are sorted by size ascending", () => {
-    for (let i = 1; i < MODEL_CATALOG.length; i++) {
-      expect(MODEL_CATALOG[i].sizeBytes).toBeGreaterThanOrEqual(MODEL_CATALOG[i - 1].sizeBytes);
-    }
+  it("has exactly one recommended model and it comes first", () => {
+    expect(MODEL_CATALOG.filter((m) => m.recommended).length).toBe(1);
+    expect(MODEL_CATALOG[0].recommended).toBe(true);
   });
 });
 
@@ -1383,16 +1384,16 @@ describe("MODEL_CATALOG", () => {
 // ══════════════════════════════════════════════════════════════════
 describe("STTEvent type contract", () => {
   it("defines all required event types", () => {
-    const eventTypes = ["state", "raw", "processed", "llm_partial", "mic", "error", "dropped", "info"];
+    const eventTypes = ["state", "asr_partial", "asr_final", "llm_token", "mic", "llm_start", "llm_end", "info"];
     // This is a type-level check; at runtime we just verify the interface shape
     const sampleEvents: STTEvent[] = [
       { type: "state", state: "listening" },
-      { type: "raw", text: "hello" },
-      { type: "processed", text: "Hello" },
-      { type: "llm_partial", text: "Hello world" },
+      { type: "asr_partial", text: "hello" },
+      { type: "asr_final", text: "Hello", latency_ms: 42 },
+      { type: "llm_token", text: "Hello world" },
       { type: "mic", level: 0.5 },
-      { type: "error", message: "fail" },
-      { type: "dropped", reason: "timeout" },
+      { type: "llm_start" },
+      { type: "llm_end", text: "Hello world" },
       { type: "info", profile: "speed", model: "tiny.en", backend: "whisper_cpp", device: "cpu" },
     ];
     for (const event of sampleEvents) {
@@ -1585,7 +1586,7 @@ describe("Accessibility: ARIA attributes", () => {
   it("SettingsPanel has role=dialog", () => {
     renderWithProviders(
       <SettingsPanel
-        settings={{ wsPort: 8765, asrProfile: "distil", backend: "auto", model: "", llmMode: "cleanup", llmProvider: "openrouter", llmModel: "", llmFallback: "", deepseekApiKey: "", openrouterApiKey: "", fastCommit: true, typing: true, clipboard: true, debug: false, hotwords: "", language: "" }}
+        settings={{ wsPort: 8765, asrProfile: "auto", backend: "sherpa_onnx", model: "", llmMode: "cleanup", llmProvider: "openrouter", llmModel: "", llmFallback: "", deepseekApiKey: "", openrouterApiKey: "", fastCommit: true, typing: true, clipboard: true, debug: false, hotwords: "", language: "" }}
         onSave={() => {}}
         visible={true}
         onClose={() => {}}

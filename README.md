@@ -144,6 +144,24 @@ The Python engine runs as a Tauri sidecar. The UI communicates via JSON events o
 
 ---
 
+## Architecture (current)
+
+The pipeline is Rust-native inside the Tauri backend (`stt-ui/src-tauri/src`) —
+no Python sidecar (see `docs/adr/0001-rust-native-backend.md`):
+
+```
+mic (cpal) → Silero VAD → Parakeet / Whisper (sherpa-onnx)
+  → LLM cleanup (local Gemma 3 via llama.cpp, or DeepSeek / OpenRouter)
+  → type into focused window / clipboard
+```
+
+History lives in SQLite at `~/.local/share/floure/history.db`
+(`STT_DATA_DIR` overrides; legacy `~/.local/share/stt/history.db` is migrated
+forward). Config lives at `~/.config/floure/config.json`.
+See [CONTEXT.md](CONTEXT.md) and [docs/adr/](docs/adr/).
+
+---
+
 ## Architecture
 
 ```

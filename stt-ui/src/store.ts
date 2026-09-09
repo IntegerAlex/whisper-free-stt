@@ -1,44 +1,110 @@
 // ── Global state store (Zustand-lite pattern with React Context) ──
 import { createContext, useContext } from "react";
 
+export type ASRBackend = "sherpa_onnx";
+export type ASRMODEL = "parakeet" | "whisper-turbo" | "whisper-base";
+export type LLMBackend = "local" | "deepseek" | "openrouter";
+export type LLMMode = "off" | "cleanup" | "bullet_list" | "email" | "commit_message";
+
+export type LlmModelBackend = "llama_cpp" | "deepseek" | "openrouter";
+
+export interface LlmModelInfo {
+  id: string;
+  name: string;
+  size: string;
+  sizeBytes: number;
+  bestFor: string;
+  backend: LlmModelBackend;
+  downloaded: boolean;
+  recommended: boolean;
+  url: string;
+  filename?: string;
+}
+
 export interface ModelInfo {
+  id: string;
   name: string;
   size: string;
   sizeBytes: number;
   speed: string;
   accuracy: string;
   bestFor: string;
-  backend: "whisper_cpp" | "faster_whisper";
-  profile: "speed" | "balanced" | "accuracy" | "distil" | "turbo";
+  backend: ASRBackend;
+  profile: ASRMODEL;
   downloaded: boolean;
   recommended: boolean;
+  url: string;
 }
 
 export const MODEL_CATALOG: ModelInfo[] = [
   {
-    name: "tiny.en", size: "~75 MB", sizeBytes: 75_000_000, speed: "🚀 Fastest", accuracy: "⭐",
-    bestFor: "Quick notes, fast responses", backend: "whisper_cpp", profile: "speed",
-    downloaded: false, recommended: true,
+    id: "parakeet-tdt-0.6b-v2-int8",
+    name: "Parakeet TDT 0.6B v2 (int8)",
+    size: "~460 MB",
+    sizeBytes: 482_468_385,
+    speed: "🚀 Fastest",
+    accuracy: "⭐⭐⭐⭐",
+    bestFor: "Fast dictation (English)",
+    backend: "sherpa_onnx",
+    profile: "parakeet",
+    downloaded: false,
+    recommended: true,
+    url: "https://github.com/k2-fsa/sherpa-onnx/releases/download/asr-models/sherpa-onnx-nemo-parakeet-tdt-0.6b-v2-int8.tar.bz2",
   },
   {
-    name: "base.en", size: "~145 MB", sizeBytes: 145_000_000, speed: "🚀 Fast", accuracy: "⭐⭐",
-    bestFor: "Daily dictation", backend: "whisper_cpp", profile: "balanced",
-    downloaded: false, recommended: false,
+    id: "whisper-large-v3-turbo-q5_1",
+    name: "Whisper large-v3-turbo (Q5_1)",
+    size: "~540 MB",
+    sizeBytes: 563_790_207,
+    speed: "⚡ Medium",
+    accuracy: "⭐⭐⭐⭐⭐",
+    bestFor: "Multilingual, high accuracy",
+    backend: "sherpa_onnx",
+    profile: "whisper-turbo",
+    downloaded: false,
+    recommended: false,
+    url: "https://github.com/k2-fsa/sherpa-onnx/releases/download/asr-models/sherpa-onnx-whisper-turbo.tar.bz2",
   },
   {
-    name: "small.en", size: "~465 MB", sizeBytes: 465_000_000, speed: "⚡ Medium", accuracy: "⭐⭐⭐",
-    bestFor: "Professional use", backend: "whisper_cpp", profile: "accuracy",
-    downloaded: false, recommended: true,
+    id: "whisper-base-q5_1",
+    name: "Whisper base (Q5_1)",
+    size: "~200 MB",
+    sizeBytes: 207_557_382,
+    speed: "🚀 Fast",
+    accuracy: "⭐⭐⭐",
+    bestFor: "Lightweight, any language",
+    backend: "sherpa_onnx",
+    profile: "whisper-base",
+    downloaded: false,
+    recommended: false,
+    url: "https://github.com/k2-fsa/sherpa-onnx/releases/download/asr-models/sherpa-onnx-whisper-base.tar.bz2",
+  },
+];
+
+export const LLM_MODEL_CATALOG: LlmModelInfo[] = [
+  {
+    id: "s1-mini-q4_k_m",
+    name: "S1-Mini (Q4_K_M)",
+    size: "~462 MB",
+    sizeBytes: 484_219_808,
+    bestFor: "ASR transcript cleanup",
+    backend: "llama_cpp",
+    downloaded: false,
+    recommended: true,
+    url: "https://huggingface.co/superwhisper/s1-mini-GGUF/resolve/main/s1-mini-q4_k_m.gguf",
+    filename: "s1-mini-q4_k_m.gguf",
   },
   {
-    name: "distil-large-v3", size: "~1.5 GB", sizeBytes: 1_500_000_000, speed: "🐢 Slower", accuracy: "⭐⭐⭐⭐",
-    bestFor: "High accuracy (GPU recommended)", backend: "faster_whisper", profile: "distil",
-    downloaded: false, recommended: false,
-  },
-  {
-    name: "large-v3-turbo", size: "~3 GB", sizeBytes: 3_000_000_000, speed: "🐢 Slow", accuracy: "⭐⭐⭐⭐⭐",
-    bestFor: "Maximum accuracy (GPU required)", backend: "faster_whisper", profile: "turbo",
-    downloaded: false, recommended: false,
+    id: "gemma-3-1b-it-q4_k_m",
+    name: "Gemma 3 1B IT (Q4_K_M)",
+    size: "~806 MB",
+    sizeBytes: 806_058_272,
+    bestFor: "Offline text cleaning",
+    backend: "llama_cpp",
+    downloaded: false,
+    recommended: false,
+    url: "https://huggingface.co/unsloth/gemma-3-1b-it-GGUF/resolve/main/gemma-3-1b-it-Q4_K_M.gguf",
+    filename: "gemma-3-1b-it-q4_k_m.gguf",
   },
 ];
 
@@ -60,6 +126,8 @@ export interface OnboardingState {
   clipboardEnabled: boolean;
   typingEnabled: boolean;
   preferredModel: string;
+  preferredLLMBackend: LLMBackend;
+  llmMode: LLMMode;
   modelDownloadProgress: Record<string, { percent: number; bytesDownloaded: number; bytesTotal: number; status: "idle" | "downloading" | "done" | "error" }>;
   error: string | null;
 }
@@ -74,6 +142,8 @@ export type OnboardingAction =
   | { type: "SET_CLIPBOARD"; enabled: boolean }
   | { type: "SET_TYPING"; enabled: boolean }
   | { type: "SET_MODEL"; name: string }
+  | { type: "SET_LLM_BACKEND"; backend: LLMBackend }
+  | { type: "SET_LLM_MODE"; mode: LLMMode }
   | { type: "SET_DOWNLOAD_PROGRESS"; name: string; percent: number; bytesDownloaded: number; bytesTotal: number; status: "idle" | "downloading" | "done" | "error" }
   | { type: "SET_ERROR"; error: string }
   | { type: "CLEAR_ERROR" };
@@ -98,6 +168,10 @@ export function onboardingReducer(state: OnboardingState, action: OnboardingActi
       return { ...state, typingEnabled: action.enabled };
     case "SET_MODEL":
       return { ...state, preferredModel: action.name };
+    case "SET_LLM_BACKEND":
+      return { ...state, preferredLLMBackend: action.backend };
+    case "SET_LLM_MODE":
+      return { ...state, llmMode: action.mode };
     case "SET_DOWNLOAD_PROGRESS":
       return {
         ...state,
@@ -128,9 +202,11 @@ export const DEFAULT_ONBOARDING: OnboardingState = {
   systemChecks: [],
   selectedMicIndex: null,
   micLevel: 0,
-  clipboardEnabled: false,
-  typingEnabled: false,
-  preferredModel: "small.en",
+  clipboardEnabled: true,
+  typingEnabled: true,
+  preferredModel: "parakeet-tdt-0.6b-v2-int8",
+  preferredLLMBackend: "local",
+  llmMode: "cleanup",
   modelDownloadProgress: {},
   error: null,
 };

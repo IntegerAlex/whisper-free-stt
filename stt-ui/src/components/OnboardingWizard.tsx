@@ -138,11 +138,11 @@ function Step2ModelDownload({
               <strong className="text-body text-text-primary">{model.name}</strong>
               <span className={cn(
                 "inline-flex items-center rounded-badge px-2 py-0.5 text-label font-semibold",
-                model.backend === "faster_whisper"
+                model.backend === "sherpa_onnx"
                   ? "bg-accent-muted border border-accent-muted-border text-accent-light"
                   : "bg-app-surface border border-border text-text-secondary",
               )}>
-                {model.backend === "faster_whisper" ? "GPU" : "CPU"}
+                {model.backend === "sherpa_onnx" ? "GPU" : "CPU"}
               </span>
             </div>
             <div className="flex items-center gap-3 text-small text-text-muted">
@@ -316,7 +316,9 @@ function Step4Permissions({
 function Step5Ready({ onFinish }: { onFinish: () => void }) {
   return (
     <div className="flex flex-col items-center gap-6 text-center">
-      <div className="text-5xl">🎙️</div>
+      <div className="w-16 h-16 rounded-full bg-accent/10 flex items-center justify-center text-accent">
+        <svg width="32" height="32" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.5" strokeLinecap="round" strokeLinejoin="round"><path d="M12 1a3 3 0 0 0-3 3v8a3 3 0 0 0 6 0V4a3 3 0 0 0-3-3z"/><path d="M19 10v2a7 7 0 0 1-14 0v-2"/><line x1="12" y1="19" x2="12" y2="23"/><line x1="8" y1="23" x2="16" y2="23"/></svg>
+      </div>
       <h2 className="text-heading text-text-primary">You're All Set!</h2>
       <p className="text-body text-text-secondary">Press <kbd className="inline-flex items-center rounded-badge px-2 py-0.5 text-label font-semibold bg-app-surface-secondary border border-border text-text-primary">Space</kbd> to start/stop dictation anytime.</p>
       <div className="w-full rounded-card bg-app-surface border border-border p-4 flex flex-col gap-2 text-left text-body text-text-secondary">

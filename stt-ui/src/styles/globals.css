@@ -67,18 +67,7 @@ body {
   background-image: url("data:image/svg+xml,%3Csvg viewBox='0 0 200 200' xmlns='http://www.w3.org/2000/svg'%3Cfilter id='n'%3E%3CfeTurbulence type='fractalNoise' baseFrequency='0.85'/%3E%3C/filter%3E%3Crect width='100%25' height='100%25' filter='url(%23n)'/%3E%3C/svg%3E");
 }
 
-/* Ambient glow layer */
-.ambient-glow {
-  position: fixed; inset: 0; pointer-events: none; z-index: 0; overflow: hidden;
-}
-.ambient-glow::before {
-  content: ''; position: absolute; top: -200px; right: -200px; width: 700px; height: 700px;
-  background: radial-gradient(circle, rgba(255,59,86,0.02) 0%, transparent 70%); filter: blur(200px);
-}
-.ambient-glow::after {
-  content: ''; position: absolute; bottom: -200px; left: -200px; width: 600px; height: 600px;
-  background: radial-gradient(circle, rgba(212,136,58,0.03) 0%, transparent 70%); filter: blur(250px);
-}
+
 
 /* Scrollbar */
 ::-webkit-scrollbar { width: 6px; }
@@ -93,10 +82,9 @@ body {
   width: 3px; height: 20px; background: var(--accent); border-radius: 0 2px 2px 0;
 }
 
-/* Stat gradient */
+/* Stat value */
 .stat-value {
-  background: linear-gradient(135deg, var(--accent), var(--lavender));
-  -webkit-background-clip: text; -webkit-text-fill-color: transparent; background-clip: text;
+  color: var(--accent);
 }
 
 /* Progress bar */

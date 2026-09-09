@@ -3,6 +3,7 @@ import { useReducer, useCallback } from "react";
 import {
   onboardingReducer,
   DEFAULT_ONBOARDING,
+  MODEL_CATALOG,
 } from "../store";
 import type { SystemCheck } from "../store";
 
@@ -13,6 +14,16 @@ interface RustCheck {
   fixHint: string | null;
 }
 
+interface RustModelStatus {
+  id: string;
+  name: string;
+  downloaded: boolean;
+}
+
+function isTauri(): boolean {
+  return typeof window !== "undefined" && "__TAURI_INTERNALS__" in window;
+}
+
 export function useOnboarding(onComplete: () => void) {
   const [state, dispatch] = useReducer(onboardingReducer, DEFAULT_ONBOARDING);
 
@@ -20,9 +31,7 @@ export function useOnboarding(onComplete: () => void) {
     let checks: SystemCheck[] = [];
 
     try {
-      // In Tauri mode, use the native Rust check_system_deps command
-      // which uses real system processes (not the restricted shell plugin)
-      if (typeof window !== "undefined" && (window as any).__TAURI_INTERNALS__) {
+      if (isTauri()) {
         const { invoke } = await import("@tauri-apps/api/core");
         const rustChecks = await invoke<RustCheck[]>("check_system_deps");
         checks = rustChecks.map((c) => ({
@@ -32,7 +41,6 @@ export function useOnboarding(onComplete: () => void) {
           fixHint: c.fixHint ?? undefined,
         }));
       } else {
-        // Web dev mode: assume everything is available
         checks = [
           { name: "Audio Server", status: "pass", message: "Audio available" },
           { name: "Clipboard Tool", status: "pass", message: "Clipboard available" },
@@ -42,7 +50,6 @@ export function useOnboarding(onComplete: () => void) {
       dispatch({ type: "SET_ERROR", error: err instanceof Error ? err.message : "System check failed" });
     }
 
-    // Disk space check (not in Rust backend yet — add here)
     checks.push({
       name: "Disk Space",
       status: "pass",
@@ -66,48 +73,37 @@ export function useOnboarding(onComplete: () => void) {
         status: "downloading",
       });
 
-      // In Tauri mode, have the sidecar download the model
       try {
-        if (typeof window !== "undefined" && (window as any).__TAURI_INTERNALS__) {
-          const { Command } = await import("@tauri-apps/plugin-shell");
-          const cmd = Command.sidecar("binaries/stt-engine", [
-            "--json-mode", "--model", name, "--asr-profile", "speed", "--llm-mode", "off",
-            "--input-file", "/dev/null",
-          ]);
-          // Track progress by parsing stdout for download info
-          cmd.stdout.on("data", (line: string) => {
-            if (line.includes("Downloading") || line.includes("download")) {
-              dispatch({
-                type: "SET_DOWNLOAD_PROGRESS",
-                name,
-                percent: 50, // approximate mid-point
-                bytesDownloaded: 0,
-                bytesTotal: 0,
-                status: "downloading",
-              });
-            }
+        if (isTauri()) {
+          const { invoke } = await import("@tauri-apps/api/core");
+          const entry = MODEL_CATALOG.find((m) => m.name === name);
+          const modelId = entry?.id ?? name;
+
+          await invoke("download_model", { id: modelId });
+
+          // Poll until the model appears downloaded.
+          await new Promise<void>((resolve) => {
+            const poll = setInterval(async () => {
+              try {
+                const statuses = await invoke<RustModelStatus[]>("check_model_status");
+                const status = statuses.find((s) => s.id === modelId);
+                if (status?.downloaded) {
+                  clearInterval(poll);
+                  dispatch({
+                    type: "SET_DOWNLOAD_PROGRESS",
+                    name,
+                    percent: 100,
+                    bytesDownloaded: 0,
+                    bytesTotal: 0,
+                    status: "done",
+                  });
+                  resolve();
+                }
+              } catch {
+                /* retry */
+              }
+            }, 2000);
           });
-          try {
-            await cmd.execute();
-            dispatch({
-              type: "SET_DOWNLOAD_PROGRESS",
-              name,
-              percent: 100,
-              bytesDownloaded: 0,
-              bytesTotal: 0,
-              status: "done",
-            });
-          } catch (err) {
-            dispatch({
-              type: "SET_DOWNLOAD_PROGRESS",
-              name,
-              percent: 0,
-              bytesDownloaded: 0,
-              bytesTotal: 0,
-              status: "error",
-            });
-            dispatch({ type: "SET_ERROR", error: `${name}: ${err instanceof Error ? err.message : "Download failed"}` });
-          }
         } else {
           dispatch({
             type: "SET_DOWNLOAD_PROGRESS",
@@ -127,7 +123,7 @@ export function useOnboarding(onComplete: () => void) {
           bytesTotal: 0,
           status: "error",
         });
-        dispatch({ type: "SET_ERROR", error: err instanceof Error ? err.message : `${name} download failed` });
+        dispatch({ type: "SET_ERROR", error: `${name}: ${err instanceof Error ? err.message : "Download failed"}` });
       }
     }
 
@@ -135,7 +131,7 @@ export function useOnboarding(onComplete: () => void) {
   }, []);
 
   const testMic = useCallback(() => {
-    // Mic test placeholder — in Tauri mode this spawns a brief capture
+    // Mic test placeholder
   }, []);
 
   const nextStep = useCallback(() => {

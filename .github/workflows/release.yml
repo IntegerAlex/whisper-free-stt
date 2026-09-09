@@ -90,29 +90,11 @@ jobs:
         with:
           workspaces: stt-ui/src-tauri
 
-      - name: Setup Python (for sidecar build)
-        uses: actions/setup-python@v5
-        with:
-          python-version: "3.12"
-
-      - name: Install uv
-        uses: astral-sh/setup-uv@v4
-        with:
-          version: "0.5"
-
-      - name: Install appimagetool (Linux)
+      - name: Install Linux dependencies
         if: matrix.platform == 'ubuntu-22.04'
         run: |
-          curl -sL https://github.com/AppImage/AppImageKit/releases/download/continuous/appimagetool-x86_64.AppImage -o /tmp/appimagetool
-          chmod +x /tmp/appimagetool
-          # Extract instead of running (FUSE not available on CI)
-          /tmp/appimagetool --appimage-extract > /dev/null 2>&1 || true
-          sudo cp /tmp/appimagetool /usr/local/bin/appimagetool
-
-      - name: Build sidecar
-        working-directory: stt-ui
-        run: bash scripts/build-sidecar.sh
-        if: matrix.platform == 'ubuntu-22.04'
+          sudo apt-get update
+          sudo apt-get install -y libasound2-dev libdbus-1-dev
 
       - name: Build Tauri app
         uses: tauri-apps/tauri-action@v0

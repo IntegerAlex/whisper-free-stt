@@ -10,29 +10,6 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
-  python-lint:
-    name: Python Lint
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-      - uses: astral-sh/setup-uv@v4
-        with:
-          version: "0.5"
-      - run: uv sync --group dev
-      - run: uv run ruff check stt/
-      - run: uv run ruff format --check stt/
-
-  python-test:
-    name: Python Tests
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-      - uses: astral-sh/setup-uv@v4
-        with:
-          version: "0.5"
-      - run: uv sync --group dev
-      - run: uv run pytest tests/ -v --tb=short
-
   frontend-lint:
     name: Frontend Lint
     runs-on: ubuntu-latest
